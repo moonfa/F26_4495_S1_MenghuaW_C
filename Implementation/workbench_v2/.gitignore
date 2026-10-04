@@ -1,0 +1,6 @@
+.env
+*.db
+*.bak
+__pycache__/
+.venv/
+local_backups/
