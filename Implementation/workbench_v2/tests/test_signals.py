@@ -48,5 +48,28 @@ class SignalTests(unittest.TestCase):
         self.assertNotIn("sector", c["company"]); self.assertEqual(len(c["company"]["long_description"]), 500)
 
 
+class BasisTests(unittest.TestCase):
+    def test_stale_statements_flagged(self):
+        from datetime import datetime, timezone
+        e = {"financial_health": {"income_statement_latest": {"period_ending": "2025-08-28", "fiscal_year": 2025}}}
+        now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+        self.assertTrue(s.evidence_basis(e, now)["statements"]["stale"])
+        self.assertTrue(any("days old" in g for g in s.data_gaps(e, now)))
+        e["financial_health"]["income_statement_latest"]["period_ending"] = "2026-06-30"
+        self.assertFalse(s.evidence_basis(e, now)["statements"]["stale"])
+
+    def test_derived_metrics_and_cyclical(self):
+        e = {"company": {"industry": "Semiconductors"}, "market": {"market_cap": 1000.0},
+             "valuation": {"pe_ttm": 10.0, "forward_pe": 5.0, "enterprise_value": 900.0},
+             "financial_health": {"free_cash_flow": 100.0}}
+        d = s.derived_metrics(e)
+        self.assertAlmostEqual(d["fcf_yield"]["value"], 0.1)
+        self.assertAlmostEqual(d["consensus_implied_eps_change"]["value"], 1.0)   # EPS expected to double
+        self.assertEqual(d["ev_to_fcf"]["value"], 9.0)
+        self.assertIn("cyclical_flag", d)
+        e["valuation"]["forward_pe"] = 20.0
+        self.assertAlmostEqual(s.derived_metrics(e)["consensus_implied_eps_change"]["value"], -0.5)  # EPS expected to halve
+
+
 if __name__ == "__main__":
     unittest.main()

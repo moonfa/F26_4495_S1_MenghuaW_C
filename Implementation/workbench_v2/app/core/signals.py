@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
@@ -160,4 +161,101 @@ def compact_evidence(evidence: dict, max_desc: int = 500) -> dict:
         comp["long_description"] = str(comp["long_description"])[:max_desc]
     e["company"] = comp
     e["recent_news"] = [{"date": n.get("date"), "title": n.get("title")} for n in (e.get("recent_news") or [])[:5]]
+    e["evidence_basis"] = evidence_basis(evidence)
+    e["data_gaps"] = data_gaps(evidence)
+    e["derived"] = derived_metrics(evidence)
     return clean(e)
+
+
+# ---------------------------------------------------------------------------
+# Evidence basis, data gaps and code-computed "what the price implies" metrics.
+# All arithmetic happens here; the model only interprets the results.
+# ---------------------------------------------------------------------------
+CYCLICAL_WORDS = ("memory", "semiconductor", "steel", "oil", "gas", "coal", "mining", "gold", "copper", "aluminum",
+                  "chemical", "auto manufacturers", "airline", "shipping", "marine", "homebuild", "building materials",
+                  "lumber", "paper", "agricultural", "farm", "equipment", "metals", "uranium", "solar")
+CYCLICAL_SECTORS = ("energy", "basic materials")
+STALE_DAYS = 380
+
+
+def _first_num(*vals):
+    for v in vals:
+        n = _num(v)
+        if n is not None:
+            return n
+    return None
+
+
+def _age_days(iso, today: date) -> int | None:
+    try:
+        return (today - date.fromisoformat(str(iso)[:10])).days
+    except ValueError:
+        return None
+
+
+def evidence_basis(ev: dict, now: datetime | None = None) -> dict:
+    """What period each block of evidence covers. Ratios have no period tag in the source (TTM / latest reported);
+    statement rows do, and they can lag the ratios right after earnings."""
+    today = (now or datetime.now(timezone.utc)).date()
+    fh = ev.get("financial_health") or {}
+    inc = fh.get("income_statement_latest") or {}
+    cfh = fh.get("cash_flow_history") or []
+    ends = [x for x in (inc.get("period_ending"), (cfh[0] or {}).get("period_ending") if cfh else None) if x]
+    age = _age_days(max(ends), today) if ends else None
+    out = {"retrieved": today.isoformat(),
+           "ratios": "TTM or latest reported (Yahoo Finance via OpenBB); the source gives no period label",
+           "statements": {"period_end": inc.get("period_ending"), "fiscal_year": inc.get("fiscal_year"),
+                          "fiscal_period": inc.get("fiscal_period"), "age_days": age,
+                          "stale": bool(age is not None and age > STALE_DAYS)}}
+    if cfh:
+        out["cash_flow_history"] = "annual fiscal years " + ", ".join(str(r.get("fiscal_year") or r.get("period_ending")) for r in cfh[:4])
+    return out
+
+
+def data_gaps(ev: dict, now: datetime | None = None) -> list[str]:
+    gaps = []
+    b = evidence_basis(ev, now)
+    if b["statements"]["stale"]:
+        gaps.append(f"Statement rows end {b['statements']['period_end']} ({b['statements']['age_days']} days old) while ratios are newer "
+                    "(TTM); do not combine figures across the two.")
+    if not (ev.get("recent_news") or []):
+        gaps.append("No news returned by the data source.")
+    if not any(_num(v) is not None for v in (ev.get("analyst_consensus") or {}).values()):
+        gaps.append("No analyst consensus data.")
+    if not any(_num(v) is not None for v in (ev.get("financial_health") or {}).values()):
+        gaps.append("No financial-health ratios.")
+    return gaps
+
+
+def is_cyclical(ev: dict) -> str | None:
+    co = ev.get("company") or {}
+    text = f"{co.get('industry') or ''} {co.get('sector') or ''}".lower()
+    hit = next((w for w in CYCLICAL_WORDS if w in text), None) or next((w for w in CYCLICAL_SECTORS if w in text), None)
+    return hit
+
+
+def derived_metrics(ev: dict) -> dict:
+    """Simple ratios computed from fields we already hold. No forecasts are invented."""
+    m, v, fh = ev.get("market") or {}, ev.get("valuation") or {}, ev.get("financial_health") or {}
+    cap = _num(m.get("market_cap"))
+    cfh = fh.get("cash_flow_history") or []
+    fcf = _first_num(fh.get("free_cash_flow"), (cfh[0] or {}).get("free_cash_flow") if cfh else None)
+    fy = (cfh[0] or {}).get("fiscal_year") if cfh else None
+    ev_val = _first_num(v.get("enterprise_value"), m.get("enterprise_value"))
+    pe, fpe = _num(v.get("pe_ttm")), _num(v.get("forward_pe"))
+    out: dict = {}
+    if cap and fcf is not None:
+        out["fcf_yield"] = {"value": round(fcf / cap, 4), "basis": f"FCF {'FY' + str(fy) if fy else 'latest'} / market cap"}
+    if ev_val and fcf:
+        out["ev_to_fcf"] = {"value": round(ev_val / fcf, 1), "basis": "enterprise value / latest annual FCF"}
+    if pe and pe > 0:
+        out["earnings_yield_ttm"] = {"value": round(1 / pe, 4), "basis": "1 / P/E (TTM)"}
+    if fpe and fpe > 0:
+        out["earnings_yield_forward"] = {"value": round(1 / fpe, 4), "basis": "1 / forward P/E (consensus)"}
+    if pe and fpe and pe > 0 and fpe > 0:
+        out["consensus_implied_eps_change"] = {"value": round(pe / fpe - 1, 3),
+            "basis": "TTM P/E divided by forward P/E at one price: analysts expect forward EPS to differ from TTM EPS by this much (derived)"}
+    hit = is_cyclical(ev)
+    if hit:
+        out["cyclical_flag"] = {"matched": hit, "caution": "Cyclical industry: a low P/E can mean peak earnings. Judge on mid-cycle earnings, not spot."}
+    return out
