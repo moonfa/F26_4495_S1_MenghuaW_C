@@ -9,12 +9,13 @@ from sqlalchemy.orm import Session
 
 from .. import config, portfolio, service
 from ..adapters.openbb_adapter import OpenBBAdapter
-from ..ai.provider import AIProviderError, BaseProvider, build_provider
-from ..core import signals
+from ..ai.provider import AIProviderError, BaseProvider, build_baseline_provider, build_provider
+from ..core import plan as plan_core, signals, thesis as thesis_core
 from ..database import get_session
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from ..models import Company, Holding, Note, Review, Snapshot, Trade
+from ..models import Company, Holding, Note, Plan, Review, Snapshot, Trade
 
 router = APIRouter(prefix="/api/v1")
 
@@ -32,6 +33,13 @@ def get_adapter() -> OpenBBAdapter:
 def get_provider() -> BaseProvider:
     try:
         return build_provider()
+    except AIProviderError as e:
+        raise HTTPException(502, e.message)
+
+
+def get_baseline_provider():
+    try:
+        return build_baseline_provider()
     except AIProviderError as e:
         raise HTTPException(502, e.message)
 
@@ -65,6 +73,20 @@ def _quote(p: dict, ticker: str) -> dict:
             "yahoo_url": f"https://finance.yahoo.com/quote/{ticker}"}
 
 
+def _pdict(p: Plan | None) -> dict | None:
+    return None if not p else {"style": p.style, "buy_below": p.buy_below, "target_price": p.target_price,
+                               "stop_price": p.stop_price, "rules": p.rules}
+
+
+def _pstat(p: Plan | None, price):
+    return plan_core.plan_status(price, p.buy_below, p.target_price, p.stop_price) if p else None
+
+
+def _snap_price(session: Session, company_id: int):
+    s = session.scalar(select(Snapshot).where(Snapshot.company_id == company_id).order_by(Snapshot.retrieved_at.desc(), Snapshot.id.desc()))
+    return s.price if s else None
+
+
 def _card(r: Review) -> dict:
     return {"id": r.id, "created_at": r.created_at, "kind": r.kind, "level": r.level,
             "view": r.view, "view_change": r.view_change, "one_liner": r.one_liner, "price": r.price}
@@ -74,6 +96,7 @@ def _card(r: Review) -> dict:
 @router.get("/companies")
 def companies(session: Session = Depends(get_session)):
     out = []
+    plans = {p.symbol: p for p in session.scalars(select(Plan))}
     for c in session.scalars(select(Company).order_by(Company.ticker)):
         last = service.latest_review(session, c.id)
         anchor = service.latest_review(session, c.id, analysed_only=True)
@@ -82,7 +105,8 @@ def companies(session: Session = Depends(get_session)):
         out.append({"ticker": c.ticker, "name": c.name, "status": c.status or "watching",
                     "view": anchor.view if anchor else None, "view_change": anchor.view_change if anchor else None,
                     "price": q.get("price"), "target_upside_pct": q.get("target_upside_pct"),
-                    "analysed_at": anchor.created_at if anchor else None, "checked_at": last.created_at if last else None})
+                    "analysed_at": anchor.created_at if anchor else None, "checked_at": last.created_at if last else None,
+                    "plan_status": _pstat(plans.get(c.ticker), q.get("price"))})
     return out
 
 
@@ -118,11 +142,13 @@ class RefreshRequest(BaseModel):
 
 @router.post("/companies/{ticker}/refresh", status_code=201)
 def refresh(ticker: str, payload: RefreshRequest, session: Session = Depends(get_session),
-            adapter=Depends(get_adapter), provider: BaseProvider = Depends(get_provider)):
+            adapter=Depends(get_adapter), provider: BaseProvider = Depends(get_provider),
+            baseline_provider=Depends(get_baseline_provider)):
     """Single entry point. The system decides: baseline, LLM update, or free no-change check."""
     try:
         r = service.refresh(session, ticker, adapter=adapter, provider=provider,
-                            language=payload.language, force_rebaseline=payload.force_rebaseline)
+                            language=payload.language, force_rebaseline=payload.force_rebaseline,
+                            baseline_provider=baseline_provider)
     except service.ServiceError as e:
         raise HTTPException(e.http, {"code": e.code, "message": e.message})
     return {**_card(r), "level_reason": r.level_reason, "llm_called": r.kind != "check"}
@@ -152,8 +178,14 @@ def brief(ticker: str, session: Session = Depends(get_session)):
     due = [{"id": n.id, "kind": n.kind, "body": n.body[:200], "revisit_on": n.revisit_on}
            for n in session.scalars(select(Note).where(Note.company_id == c.id, Note.done.is_(False), Note.revisit_on.is_not(None),
                                     Note.revisit_on <= date.today().isoformat()).order_by(Note.revisit_on))]
+    hold = session.scalar(select(Holding).where(Holding.symbol == c.ticker))
+    pl = session.scalar(select(Plan).where(Plan.symbol == c.ticker))
+    position = {"quantity": hold.quantity, "cost": hold.cost, "pnl_pct": hold.pnl_pct, "weight": hold.weight,
+                "currency": hold.currency, "kind": hold.kind} if hold else None
     return {
-        "news": news, "due_notes": due, "status": c.status or "watching",
+        "position": position, "plan": _pdict(pl), "plan_status": _pstat(pl, p1 if p1 is not None else (hold.price if hold else None)),
+        "news": news, "due_notes": due, "health": thesis_core.health(anchor.state["assumptions"])[0],
+        "health_reason": thesis_core.health(anchor.state["assumptions"])[1], "status": c.status or "watching",
         "data_notes": {"missing": (last_snap.payload.get("data_quality") or {}).get("sections_missing"),
                        "warnings": (last_snap.payload.get("data_quality") or {}).get("warnings"),
                        "gaps": [g for g in signals.data_gaps(last_snap.payload) if "news" not in g.lower()]},
@@ -163,7 +195,7 @@ def brief(ticker: str, session: Session = Depends(get_session)):
         "last_check_level": latest.level, "last_check_reason": latest.level_reason,
         "quote": _quote(last_snap.payload, c.ticker), "as_of": last_snap.retrieved_at,
         "price": p1, "price_since_analysis_pct": round((p1 - p0) / p0, 4) if p0 and p1 else None,
-        "health": health, "assumptions": assumptions,
+        "health_counts": health, "assumptions": assumptions, "valuation": anchor.state.get("valuation"),
         "top_changes": anchor.changes or [], "monitor": anchor.state["monitor"],
         "rebaseline_suggested": bool(anchor.state.get("rebaseline")),
         "meta": {"review_id": anchor.id, "kind": anchor.kind, "model": anchor.model,
@@ -216,7 +248,7 @@ def timeline(ticker: str, session: Session = Depends(get_session)):
     for r in _reviews(session, c.id):
         d = r.delta or {}
         out.append({**_card(r), "level_reason": r.level_reason,
-                    "changes": r.changes or [], "assumption_changes": _a_changes(prev_analysed, r) if r.kind != "check" else [],
+                    "changes": r.changes or [], "what_changed": (r.state or {}).get("what_changed") if r.kind == "update" else None, "assumption_changes": _a_changes(prev_analysed, r) if r.kind != "check" else [],
                     "delta_summary": {"price_pct": d.get("price_pct"), "n_fundamental": len(d.get("fundamental_changes") or []),
                                       "n_news": len(d.get("new_news") or [])}})
         if r.kind != "check":
@@ -337,16 +369,21 @@ async def import_trades(file: UploadFile = File(...), session: Session = Depends
 def get_portfolio(session: Session = Depends(get_session)):
     hs = list(session.scalars(select(Holding).order_by(Holding.weight.desc())))
     cos = {c.ticker: c for c in session.scalars(select(Company))}
+    plans = {p.symbol: p for p in session.scalars(select(Plan))}
     items, caut, unan = [], 0.0, 0.0
     for h in hs:
         c = cos.get(h.symbol)
         a = service.latest_review(session, c.id, analysed_only=True) if c else None
         w = h.weight or 0.0
+        px = _snap_price(session, c.id) if c else None
+        px = px if px is not None else h.price
+        pl = plans.get(h.symbol)
         caut += w if a and a.view == "cautious" else 0.0
         unan += w if (not a and h.kind == "stock") else 0.0
         items.append({"id": h.id, "code": h.code, "symbol": h.symbol, "name": h.name, "kind": h.kind, "currency": h.currency,
                       "quantity": h.quantity, "price": h.price, "pnl_pct": h.pnl_pct, "weight": h.weight,
-                      "analysed": bool(a), "view": a.view if a else None})
+                      "analysed": bool(a), "view": a.view if a else None,
+                      "plan": _pdict(pl), "plan_status": _pstat(pl, px)})
     return {"count": len(hs), "top5": sum(h.weight or 0 for h in hs[:5]), "cautious": caut, "unanalysed": unan,
             "imported_at": hs[0].imported_at if hs else None, "items": items}
 
@@ -363,3 +400,55 @@ def set_kind(holding_id: int, payload: KindIn, session: Session = Depends(get_se
     h.kind = payload.kind
     session.commit()
     return {"ok": True}
+
+
+@router.get("/usage")
+def usage(session: Session = Depends(get_session)):
+    """Model calls that produced a stored analysis today (Pacific time, when Google resets daily quotas).
+    Rejected or retried calls are not recorded, so the real quota use can be higher."""
+    pt = ZoneInfo("America/Los_Angeles")
+    start = datetime.now(pt).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    by: dict[str, int] = {}
+    for r in session.scalars(select(Review).where(Review.created_at >= start, Review.kind != "check")):
+        by[r.model or r.provider] = by.get(r.model or r.provider, 0) + 1
+    return {"calls": sum(by.values()), "by_model": by}
+
+
+# ---------------------------------------------------------------- position plans
+class PlanIn(BaseModel):
+    style: Literal["investment", "trade", "defensive"] = "investment"
+    buy_below: float | None = Field(default=None, gt=0)
+    target_price: float | None = Field(default=None, gt=0)
+    stop_price: float | None = Field(default=None, gt=0)
+    rules: str = Field(default="", max_length=2000)
+
+
+@router.put("/plans/{symbol}")
+def put_plan(symbol: str, payload: PlanIn, session: Session = Depends(get_session)):
+    sym = symbol.strip().upper()
+    if payload.stop_price and payload.target_price and payload.stop_price >= payload.target_price:
+        raise HTTPException(400, "Stop must be below the target price.")
+    if payload.buy_below and payload.target_price and payload.buy_below >= payload.target_price:
+        raise HTTPException(400, "Buy-at-or-below must be below the target price.")
+    p = session.scalar(select(Plan).where(Plan.symbol == sym)) or Plan(symbol=sym)
+    p.style, p.buy_below, p.target_price, p.stop_price, p.rules = (payload.style, payload.buy_below, payload.target_price,
+                                                                      payload.stop_price, payload.rules.strip())
+    p.updated_at = datetime.now(timezone.utc)
+    session.add(p)
+    session.commit()
+    return {"ok": True}
+
+
+@router.delete("/plans/{symbol}")
+def delete_plan(symbol: str, session: Session = Depends(get_session)):
+    session.query(Plan).filter(Plan.symbol == symbol.strip().upper()).delete()
+    session.commit()
+    return {"ok": True}
+
+
+@router.get("/companies/{ticker}/trades")
+def company_trades(ticker: str, session: Session = Depends(get_session)):
+    c = _company(session, ticker)
+    rows = session.scalars(select(Trade).where(Trade.symbol == c.ticker).order_by(Trade.executed_at.desc()))
+    return [{"id": t.id, "side": t.side, "quantity": t.quantity, "price": t.price, "amount": t.amount, "fee": t.fee,
+             "currency": t.currency, "executed_at": t.executed_at} for t in rows]
