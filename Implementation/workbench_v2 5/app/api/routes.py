@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import config, portfolio, service
+from .. import config, portfolio, security, service
 from ..adapters.openbb_adapter import OpenBBAdapter
 from ..ai.provider import AIProviderError, BaseProvider, build_baseline_provider, build_provider
-from ..core import plan as plan_core, signals, thesis as thesis_core
+from ..ai import prompts
+from ..ai.schemas import TranslationOutput
+from ..core import plan as plan_core, signals, thesis as thesis_core, translate as zh_core
 from ..database import get_session
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -87,6 +89,17 @@ def _snap_price(session: Session, company_id: int):
     return s.price if s else None
 
 
+def _loc(r: Review, lang: str) -> dict:
+    """The review's text fields, in Chinese when lang == "zh" and a stored translation exists."""
+    base = {"one_liner": r.one_liner, "narrative": r.narrative, "changes": r.changes or [], "state": r.state}
+    return zh_core.localize(base, (r.zh or {}).get("items")) if lang == "zh" and r.zh else base
+
+
+class _S:                                   # lets _a_changes read a localized state
+    def __init__(self, state):
+        self.state = state
+
+
 def _card(r: Review) -> dict:
     return {"id": r.id, "created_at": r.created_at, "kind": r.kind, "level": r.level,
             "view": r.view, "view_change": r.view_change, "one_liner": r.one_liner, "price": r.price}
@@ -97,12 +110,13 @@ def _card(r: Review) -> dict:
 def companies(session: Session = Depends(get_session)):
     out = []
     plans = {p.symbol: p for p in session.scalars(select(Plan))}
+    broker = {h.symbol: h.name for h in session.scalars(select(Holding)) if h.name}     # the name you see in your broker app
     for c in session.scalars(select(Company).order_by(Company.ticker)):
         last = service.latest_review(session, c.id)
         anchor = service.latest_review(session, c.id, analysed_only=True)
         snap = session.get(Snapshot, last.snapshot_id) if last else None
         q = _quote(snap.payload, c.ticker) if snap else {}
-        out.append({"ticker": c.ticker, "name": c.name, "status": c.status or "watching",
+        out.append({"ticker": c.ticker, "name": c.name, "alias": broker.get(c.ticker), "status": c.status or "watching",
                     "view": anchor.view if anchor else None, "view_change": anchor.view_change if anchor else None,
                     "price": q.get("price"), "target_upside_pct": q.get("target_upside_pct"),
                     "analysed_at": anchor.created_at if anchor else None, "checked_at": last.created_at if last else None,
@@ -156,15 +170,16 @@ def refresh(ticker: str, payload: RefreshRequest, session: Session = Depends(get
 
 # ---------------------------------------------------------------- page 1: brief
 @router.get("/companies/{ticker}/brief")
-def brief(ticker: str, session: Session = Depends(get_session)):
+def brief(ticker: str, lang: str = "en", session: Session = Depends(get_session)):
     c = _company(session, ticker)
     latest = service.latest_review(session, c.id)
     if not latest:
         raise HTTPException(404, "No review yet.")
     anchor = service.latest_review(session, c.id, analysed_only=True)
+    L = _loc(anchor, lang)
     prior = session.get(Review, anchor.prev_review_id) if anchor and anchor.prev_review_id else None
     old = {a["id"]: a["status"] for a in (prior.state["assumptions"] if prior else [])}
-    assumptions = [{**a, "prev_status": old.get(a["id"])} for a in anchor.state["assumptions"]]
+    assumptions = [{**a, "prev_status": old.get(a["id"])} for a in L["state"]["assumptions"]]
     health: dict[str, int] = {}
     for a in assumptions:
         health[a["status"]] = health.get(a["status"], 0) + 1
@@ -195,13 +210,13 @@ def brief(ticker: str, session: Session = Depends(get_session)):
                        "warnings": (last_snap.payload.get("data_quality") or {}).get("warnings"),
                        "gaps": [g for g in signals.data_gaps(last_snap.payload) if "news" not in g.lower()]},
         "ticker": c.ticker, "name": c.name, "language": c.language,
-        "view": anchor.view, "view_change": anchor.view_change, "one_liner": anchor.one_liner,
+        "view": anchor.view, "view_change": anchor.view_change, "one_liner": L["one_liner"], "zh_available": bool(anchor.zh),
         "analysed_at": anchor.created_at, "checked_at": latest.created_at,
         "last_check_level": latest.level, "last_check_reason": latest.level_reason,
         "quote": _quote(last_snap.payload, c.ticker), "as_of": last_snap.retrieved_at,
         "price": p1, "price_since_analysis_pct": round((p1 - p0) / p0, 4) if p0 and p1 else None,
-        "health_counts": health, "assumptions": assumptions, "valuation": anchor.state.get("valuation"),
-        "top_changes": anchor.changes or [], "monitor": anchor.state["monitor"],
+        "health_counts": health, "assumptions": assumptions, "valuation": L["state"].get("valuation"),
+        "top_changes": L["changes"], "monitor": L["state"]["monitor"],
         "rebaseline_suggested": bool(anchor.state.get("rebaseline")),
         "meta": {"review_id": anchor.id, "kind": anchor.kind, "model": anchor.model,
                  "prompt_version": anchor.prompt_version, "usage": anchor.usage},
@@ -210,12 +225,13 @@ def brief(ticker: str, session: Session = Depends(get_session)):
 
 # ---------------------------------------------------------------- page 2: thesis
 @router.get("/companies/{ticker}/thesis")
-def thesis(ticker: str, session: Session = Depends(get_session)):
+def thesis(ticker: str, lang: str = "en", session: Session = Depends(get_session)):
     c = _company(session, ticker)
     revs = [r for r in _reviews(session, c.id) if r.kind != "check"]
     if not revs:
         raise HTTPException(404, "No review yet.")
     cur = revs[-1]
+    L = _loc(cur, lang)
     history: dict[str, list] = {}
     for r in revs:
         for a in r.state["assumptions"]:
@@ -223,9 +239,11 @@ def thesis(ticker: str, session: Session = Depends(get_session)):
     by_a: dict[str, list] = {}
     for n in session.scalars(select(Note).where(Note.company_id == c.id, Note.assumption_id.is_not(None)).order_by(Note.created_at.desc())):
         by_a.setdefault(n.assumption_id, []).append({"id": n.id, "body": n.body, "created_at": n.created_at})
-    return {"profile": cur.state["profile"], "assumptions": [{**a, "history": history[a["id"]], "notes": by_a.get(a["id"], [])}
-            for a in cur.state["assumptions"]], "monitor": cur.state["monitor"],
-            "report_markdown": next((r.narrative for r in reversed(revs) if r.kind in ("baseline", "rebaseline")), "")}
+    src = next((r for r in reversed(revs) if r.kind in ("baseline", "rebaseline")), None)
+    return {"profile": L["state"]["profile"], "assumptions": [{**a, "history": history[a["id"]], "notes": by_a.get(a["id"], [])}
+            for a in L["state"]["assumptions"]], "monitor": L["state"]["monitor"], "zh_available": bool(cur.zh), "review_id": cur.id,
+            "report_markdown": _loc(src, lang)["narrative"] if src else "", "report_review_id": src.id if src else None,
+            "report_zh": bool(src.zh) if src else False}
 
 
 # ---------------------------------------------------------------- page 3: fundamentals
@@ -247,28 +265,51 @@ def fundamentals(ticker: str, session: Session = Depends(get_session)):
 
 # ---------------------------------------------------------------- page 4: timeline
 @router.get("/companies/{ticker}/timeline")
-def timeline(ticker: str, session: Session = Depends(get_session)):
+def timeline(ticker: str, lang: str = "en", session: Session = Depends(get_session)):
     c = _company(session, ticker)
-    out, prev_analysed = [], None
+    out, prev_loc = [], None
     for r in _reviews(session, c.id):
-        d = r.delta or {}
-        out.append({**_card(r), "level_reason": r.level_reason,
-                    "changes": r.changes or [], "what_changed": (r.state or {}).get("what_changed") if r.kind == "update" else None, "assumption_changes": _a_changes(prev_analysed, r) if r.kind != "check" else [],
+        d, L = r.delta or {}, _loc(r, lang)
+        out.append({**_card(r), "one_liner": L["one_liner"], "level_reason": r.level_reason, "zh_available": bool(r.zh),
+                    "changes": L["changes"], "what_changed": (r.state or {}).get("what_changed") if r.kind == "update" else None,
+                    "assumption_changes": _a_changes(_S(prev_loc["state"]) if prev_loc else None, _S(L["state"])) if r.kind != "check" else [],
                     "delta_summary": {"price_pct": d.get("price_pct"), "n_fundamental": len(d.get("fundamental_changes") or []),
                                       "n_news": len(d.get("new_news") or [])}})
         if r.kind != "check":
-            prev_analysed = r
+            prev_loc = L
     return out
 
 
 @router.get("/reviews/{review_id}")
-def review_detail(review_id: int, session: Session = Depends(get_session)):
+def review_detail(review_id: int, lang: str = "en", session: Session = Depends(get_session)):
     r = session.get(Review, review_id)
     if not r:
         raise HTTPException(404, "Review not found")
-    return {**_card(r), "level_reason": r.level_reason, "state": r.state, "narrative": r.narrative,
-            "changes": r.changes, "delta": r.delta, "meta": {"model": r.model, "provider": r.provider,
+    L = _loc(r, lang)
+    return {**_card(r), "one_liner": L["one_liner"], "level_reason": r.level_reason, "state": L["state"], "narrative": L["narrative"],
+            "changes": L["changes"], "zh_available": bool(r.zh), "delta": r.delta, "meta": {"model": r.model, "provider": r.provider,
             "prompt_version": r.prompt_version, "usage": r.usage, "snapshot_id": r.snapshot_id}}
+
+
+@router.post("/reviews/{review_id}/translate")
+def translate_review(review_id: int, session: Session = Depends(get_session), provider: BaseProvider = Depends(get_provider)):
+    """Manual, once per review: one model call over the free-text fields only. Stored; later views cost nothing."""
+    r = session.get(Review, review_id)
+    if not r:
+        raise HTTPException(404, "Review not found")
+    if r.zh:
+        return {"ok": True, "cached": True}
+    src = zh_core.flatten({"one_liner": r.one_liner, "narrative": r.narrative, "changes": r.changes or [], "state": r.state})
+    try:
+        res = provider.run(system=prompts.TRANSLATE_SYSTEM, schema=TranslationOutput, payload=prompts.translate_payload(src), max_tokens=12000)
+    except AIProviderError as e:
+        raise HTTPException(502, {"code": e.code, "message": e.message})
+    got = {i["k"]: i["t"] for i in res.data.get("items", []) if i.get("k") in src and str(i.get("t", "")).strip()}
+    if len(got) < max(1, int(len(src) * 0.6)):
+        raise HTTPException(502, {"code": "translation_incomplete", "message": f"The model returned {len(got)} of {len(src)} text items. Nothing was saved; try again."})
+    r.zh = {"items": got, "model": getattr(res, "model", "") or provider.model, "usage": res.usage, "missing": len(src) - len(got)}
+    session.commit()
+    return {"ok": True, "cached": False, "translated": len(got), "of": len(src)}
 
 
 @router.get("/companies/{ticker}/compare")
@@ -337,8 +378,11 @@ def note_delete(note_id: int, session: Session = Depends(get_session)):
 
 # ---------------------------------------------------------------- portfolio (broker CSV import)
 async def _read_csv(file: UploadFile, parser):
+    raw = await file.read(security.MAX_UPLOAD + 1)
+    if len(raw) > security.MAX_UPLOAD:
+        raise HTTPException(413, "File is too large for a broker export (limit 5 MB).")
     try:
-        items = parser(portfolio.decode(await file.read()))
+        items = parser(portfolio.decode(raw))
     except ValueError as e:
         raise HTTPException(400, f"{e}. Is this the right export?")
     return items

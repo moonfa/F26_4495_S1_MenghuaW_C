@@ -8,11 +8,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import config  # noqa: F401  (loads .env before anything else)
 from .api.routes import router
 from .api.journal import router as journal_router
-from .database import Base, engine, ensure_columns
+from .database import Base, engine, ensure_columns, normalize_symbols
 from . import models  # noqa: F401
 
 Base.metadata.create_all(engine)
 ensure_columns()
+normalize_symbols()
 STATIC = Path(__file__).resolve().parent / "static"
 log = logging.getLogger("uvicorn.error")
 

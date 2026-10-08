@@ -6,7 +6,7 @@ Tracks an investment **thesis** per company over time instead of regenerating on
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # AI_PROVIDER=mock works with no API key
-python -m uvicorn app.main:app --reload --reload-dir app   # --reload-dir app: do not watch .venv (OpenBB rebuilds files there)
+python -m uvicorn app.main:app --reload --reload-dir app   # --reload-dir app: do not watch .venv. Keep the default host 127.0.0.1; never use --host 0.0.0.0 (the app has no login)
 ./check.sh   # shows which folder/version the server on :8000 is really running
 python -m unittest tests.test_signals -v   # pure-Python change-detection tests
 python -m unittest tests.test_signals tests.test_portfolio tests.test_thesis tests.test_prompts   # pure-Python tests

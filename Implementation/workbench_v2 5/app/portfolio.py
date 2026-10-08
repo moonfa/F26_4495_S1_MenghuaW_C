@@ -4,13 +4,14 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 TZ = {"美东": "America/New_York", "香港": "Asia/Hong_Kong", "新加坡": "Asia/Singapore"}
 FILLED = {"全部成交", "部成已撤"}          # fully filled, or partly filled then cancelled
 CASH_WORDS = ("货币", "money market", "现金", "cash")
-ETF_WORDS = ("etf", "etn", "基金", "fund", "trust", "信托", "指数", "index")
+ETF_WORDS = ("etf", "etn", "基金", "fund", "trust", "信托", "指数", "index", "treasury", "bond", "债", "零息")
 
 
 def decode(raw: bytes) -> str:
@@ -49,11 +50,20 @@ def _cell(row: list[str], i: int) -> str:
     return row[i].strip() if i < len(row) else ""
 
 
+CLASS_SHARE = re.compile(r"^[A-Z]{1,5}\.[A-Z]$")
+
+
+def norm_symbol(s: str) -> str:
+    """Brokers write US share classes as BRK.B; Yahoo (and so OpenBB) wants BRK-B. Exchange suffixes (.HK, .SI) are kept."""
+    s = s.strip().upper()
+    return s.replace(".", "-") if CLASS_SHARE.match(s) and not s.endswith((".HK", ".SI")) else s
+
+
 def symbol_of(code: str, currency: str | None = None) -> str:
     code = code.strip().upper()
     if code.isdigit():
         return f"{int(code):04d}.HK"
-    return f"{code}.SI" if currency == "SGD" else code
+    return f"{code}.SI" if currency == "SGD" else norm_symbol(code)
 
 
 def currency_of(code: str) -> str:

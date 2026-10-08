@@ -58,6 +58,7 @@ class Review(Base):
     prompt_version: Mapped[str] = mapped_column(String(60), default="")
     input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)     # token counts
+    zh: Mapped[dict | None] = mapped_column(JSON, nullable=True)        # {"items": {key: Chinese text}, "model", "usage"}
     __table_args__ = (Index("ix_review_company_time", "company_id", "created_at", "id"),)
 
 

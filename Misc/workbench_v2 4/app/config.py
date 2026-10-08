@@ -33,4 +33,4 @@ def _models(raw: str) -> list[str]:
 
 AI_MODEL_FALLBACKS = _models(os.getenv("AI_MODEL_FALLBACKS", ""))   # tried in order when a model is out of quota
 
-APP_VERSION = "2.8.0-lists-journal-tips"
+APP_VERSION = "2.9.1-fixes"

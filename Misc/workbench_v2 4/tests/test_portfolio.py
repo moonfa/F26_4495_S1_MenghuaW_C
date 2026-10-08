@@ -32,6 +32,11 @@ class PortfolioTests(unittest.TestCase):
         r, rep = p.parse_trades_report(t)
         self.assertEqual((rep["rows"], rep["unfilled"], rep["bad_row"], rep["symbols"]), (3, 1, 1, ["TLT"]))
 
+    def test_share_class_symbols(self):
+        self.assertEqual(p.norm_symbol("BRK.B"), "BRK-B"); self.assertEqual(p.norm_symbol("bf.b"), "BF-B")
+        self.assertEqual(p.norm_symbol("0700.HK"), "0700.HK"); self.assertEqual(p.symbol_of("BRK.B", "USD"), "BRK-B")
+        self.assertEqual(p.symbol_of("C09", "SGD"), "C09.SI")
+
     def test_holdings(self):
         t = "代码\t名称\t现价\t今日盈亏\t摊薄成本价\t持仓盈亏\t盈亏比例\t持有数量\t市值\t持仓占比\nABEV\tAmbev SA\t2.860\t60.00\t1.007\t2,778.98\t184.01%\t1,500\t4,290.00\t0.73%\nTLT\tiShares 20+ Year Treasury Bond ETF\t90\t0\t95\t-50\t-5%\t10\t900\t0.15%"
         r = p.parse_holdings(t)
