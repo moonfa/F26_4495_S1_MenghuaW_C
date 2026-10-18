@@ -1,5 +1,5 @@
 import json, sqlite3, unittest
-from app.core.snapshots import history_rows
+from app.core.snapshots import history_rows, delete_record, prune_data
 
 
 def db(rows):
@@ -32,6 +32,29 @@ class History(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["label"], "Saved comparison")
         self.assertIsNone(next(r for r in rows if r["id"] == "a1")["summary"]["base"])
+
+
+class Delete(unittest.TestCase):
+    def rows(self):
+        return db([("d1", "WMT", "data", "t1", dict(quote={})), ("d2", "WMT", "data", "t2", dict(quote={})), ("d3", "WMT", "data", "t3", dict(quote={})),
+                   ("a1", "WMT", "analysis", "t4", dict(data_id="d2", result={})), ("o1", "MU", "data", "t5", {})])
+
+    def test_data_in_use_is_refused_and_analysis_can_go(self):
+        c = self.rows()
+        self.assertEqual(delete_record(c, "d2"), "in_use")
+        self.assertEqual(delete_record(c, "a1"), "deleted")
+        self.assertEqual(delete_record(c, "d2"), "deleted")      # nothing uses it any more
+        self.assertEqual(delete_record(c, "nope"), "missing")
+
+    def test_prune_keeps_latest_and_anything_in_use(self):
+        c = self.rows()
+        self.assertEqual(prune_data(c, "wmt"), 1)               # d1 only: d3 is the newest, d2 is used
+        left = {r[0] for r in c.execute("SELECT id FROM valuations")}
+        self.assertEqual(left, {"d2", "d3", "a1", "o1"})        # other tickers untouched
+
+    def test_comparison_keeps_its_data(self):
+        c = db([("d1", "A", "data", "t", {}), ("d2", "A", "data", "t", {}), ("c1", "A+B", "comparison", "t", dict(data_ids=["d1"]))])
+        self.assertEqual(prune_data(c, "A"), 0)
 
 
 if __name__ == "__main__":

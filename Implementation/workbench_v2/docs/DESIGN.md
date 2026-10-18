@@ -1,6 +1,6 @@
 ---
 title: "Personal Investment Workbench v2 — Design Document"
-subtitle: "Thesis tracking, portfolio, position plans, trade review and portfolio journal (version 2.23.1)"
+subtitle: "Thesis tracking, portfolio, position plans, trade review and portfolio journal (version 2.27.0)"
 date: "2026-10-13"
 ---
 
@@ -491,3 +491,21 @@ Table `assumption_drivers` is created on start-up. Deleting a company removes it
 - **What is written to `valuation.db`:** *Import latest data* writes a `data` record; *Compare* writes `data` records for tickers it loads (reusing one younger than 6 hours) and one `comparison` record; *Save snapshot* writes an `analysis` record. Typing, switching tabs and live preview write nothing (`persist: false`). Nothing is overwritten.
 - The company page reads the newest `data` record and the newest `analysis` record of each method (`api/valuation_link.py`); it does not read comparisons or unsaved previews.
 - The Saved snapshots list is built by `core/snapshots.history_rows` and labels each record (method and Base return for analyses, price for imported data) and shows local time.
+
+## 6I. Valuation lab 2.24.0: records, language, question card
+
+- **Fewer records.** Importing a ticker again replaces earlier imports that no saved analysis or comparison uses (`core/snapshots.prune_data`); the newest import always stays. A record can be deleted from the Saved snapshots list after an in-page confirmation (`DELETE /api/v1/valuation/snapshots/{id}`); imported data that a saved result still points to is refused with a message (HTTP 409) so a saved result can always be reproduced. "Remove unused imports" does the same clean-up on demand (`POST /api/v1/valuation/{ticker}/cleanup`). Records are never edited.
+- **Language.** An English / 中文 switch (remembered in the browser; `?lang=zh` also works, and the company page passes it on). Chinese covers the Guide, every "?" explanation, the intro texts, the conclusion block, the "same basis at the exit" line, the analyst-versus-scenario and guesswork notes, the dislocation explanation and the snapshot list. Table and column labels and the notes the backend writes stay in English, as indicators do in the rest of the app.
+- **Question card.** The company page shows "A question to write down" whenever the valuation yields one (before, only when earnings were far from analyst expectations). The text is editable, an optional look-again date is saved as `revisit_on`, and it is stored as a `question` note.
+- **Tests.** The lifecycle test now expects a free `check` after an update (the update becomes the new anchor, so identical inputs mean nothing changed); the API tests accept the `peer_symbols` argument.
+
+## 6J. 2.25.0: other currencies, Fundamentals layout, Overview
+- **Other currencies.** When a company is quoted in one currency and reports in another (0883.HK: HKD price, CNY accounts), reported figures and analyst EPS/revenue are converted once to the quote currency at the latest daily spot rate (Yahoo pair, inverse if needed; pence/pounds need no rate). The rate is held constant to the exit date, and every converted figure says so. If no rate can be fetched the methods that mix the two currencies stay blocked and the message says why. The valuation is therefore in the currency you see the price in (HKD for 0883.HK), not USD.
+- **Fundamentals tab.** Read top to bottom in three sections: what you pay (multiples, analyst consensus, what the price implies), what you get (growth, profitability, balance sheet), then the record (annual and quarterly results, free cash flow). Labels no longer wrap into narrow columns.
+- **Overview.** The period digest tiles jump to their sections and use the same titles as the sections below them; the digest is laid out in two columns. The Companies and Holdings tables can be sorted by best or worst P&L and by weight.
+
+## 6K. 2.27.0: back to the same company; two things tried and removed
+- **Back to the same company.** "← Workbench" on the Valuation lab opens the company named in its Ticker box, on the Valuation tab (`/?t=TICKER`). With no ticker, or one the workbench does not follow, it opens the Overview as before.
+- **Tried and removed: analyst forecasts as extra columns in the Fundamentals tables.** The reported-results columns were often empty for revenue and EPS while the forecast columns were full (or the reverse), so the table showed either no history or no forecast and was harder to read than the two separate views. Analyst expectations stay where they were: the consensus card and "What the price implies" on Fundamentals, and the annual and quarterly estimates in the Valuation lab.
+- **Tried and removed: saving readings (a bookmark button into the Journal).** It added a step for little gain over the Journal's existing External source entry, which remains available for anyone who wants to note something they read.
+- The design work is complete at this version.

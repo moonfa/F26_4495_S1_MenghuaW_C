@@ -37,3 +37,41 @@ def history_rows(conn, ticker, limit=50):
             payload = {}
         out.append(dict(id=ident, kind=kind, created_at=created, label=KIND_LABEL.get(kind, kind), summary=_summary(kind, ticker, payload)))
     return out
+
+
+def referenced_ids(conn):
+    """Ids of data records that a saved analysis or comparison points to. Those must stay: they reproduce the result."""
+    ids = set()
+    for kind, raw in conn.execute("SELECT kind,payload FROM valuations WHERE kind IN ('analysis','comparison')"):
+        try:
+            p = json.loads(raw)
+        except ValueError:
+            continue
+        if kind == "analysis" and p.get("data_id"):
+            ids.add(p["data_id"])
+        elif kind == "comparison":
+            ids.update(p.get("data_ids") or [])
+    return ids
+
+
+def delete_record(conn, ident):
+    """The user deletes one record. An imported-data record that a saved result still uses is refused ('in_use')."""
+    row = conn.execute("SELECT kind FROM valuations WHERE id=?", (ident,)).fetchone()
+    if not row:
+        return "missing"
+    if row[0] == "data" and ident in referenced_ids(conn):
+        return "in_use"
+    conn.execute("DELETE FROM valuations WHERE id=?", (ident,))
+    return "deleted"
+
+
+def prune_data(conn, ticker, keep_latest=True):
+    """Remove imported data for a ticker that nothing uses (no saved analysis or comparison points to it). The newest import is kept."""
+    ids = [r[0] for r in conn.execute("SELECT id FROM valuations WHERE ticker=? AND kind='data' ORDER BY rowid DESC", (ticker.upper(),))]
+    if keep_latest:
+        ids = ids[1:]
+    used = referenced_ids(conn)
+    gone = [i for i in ids if i not in used]
+    for i in gone:
+        conn.execute("DELETE FROM valuations WHERE id=?", (i,))
+    return len(gone)

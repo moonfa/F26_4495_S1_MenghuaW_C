@@ -1,5 +1,6 @@
 """Enrich existing valuation data with current/historical multiples and optional peers."""
 from datetime import date,datetime,timezone
+from ..core.fx import conv_rows,conv_estimates
 from ..core.multiples import multiple_context,method_fit
 from ..core.valuation_context import num,ratio,historical_pe,to_date,consensus_period_end,earnings_quality_flags,status_quo,fcf_anchors,pfcf_defaults,earnings_dislocation,industry_summary,consensus_quarter_end,growth_refs
 
@@ -17,8 +18,28 @@ def enrich(data,stock,info,peer_symbols=()):
     now=data['retrieved_at'];price=data['quote'].get('value');currency=data['quote'].get('currency')
     source='yfinance/Yahoo: get_info'
     financial_currency=info.get('financialCurrency')
+    fx=data.get('fx') or {};conv=fx['rate'] if fx.get('applied') else 1.0
+    if fx.get('applied'):
+        # Everything the provider reports in the financial currency is turned into the quote currency once, here,
+        # so the rest of the app sees one currency. The original numbers stay in data['raw'].
+        conv_estimates(data['estimates'],fx)
+        conv_rows(data['historical'],conv,('revenue','net_income','diluted_eps','ebitda'))
+        conv_rows(data['anchors'],conv,('value',))
+        conv_rows(data.get('cashflow'),conv,('ocf','capex','fcf','sbc'))
+        if data.get('cashflow_ttm'): conv_rows([data['cashflow_ttm']],conv,('ocf','capex','fcf','sbc'))
+        for r in data['historical']+data['anchors']:
+            if r.get('currency')==fx['from']: r['currency']=fx['to'];r['fx_from']=fx['from']
+        for a_ in data['anchors']: a_['basis']=(a_.get('basis') or '')+' '+fx['text']
+    def eps_in_quote(eps,pe):
+        """The provider's own P/E is price ÷ EPS in the quote currency. If that reproduces it, the EPS is already in the quote currency."""
+        return bool(eps and pe and price and eps>0 and pe>0 and abs(price/eps/pe-1)<.04)
+    t_eps=num(info.get('trailingEps'));f_eps=num(info.get('forwardEps'))
+    t_quote=eps_in_quote(t_eps,num(info.get('trailingPE')))
+    if fx.get('applied') and not t_quote and t_eps is not None: t_eps_q=t_eps*conv
+    else: t_eps_q=t_eps
+    if fx.get('applied') and not eps_in_quote(f_eps,num(info.get('forwardPE'))) and f_eps is not None: f_eps=f_eps*conv
     current=dict(trailing_pe=num(info.get('trailingPE')),forward_pe=num(info.get('forwardPE')),
-                 trailing_eps=num(info.get('trailingEps')),forward_eps=num(info.get('forwardEps')),
+                 trailing_eps=t_eps_q,forward_eps=f_eps,
                  enterprise_to_ebitda=num(info.get('enterpriseToEbitda')),
                  source=source,retrieved_at=now,published_at=None,
                  basis='Provider current metrics. Forward EPS horizon and GAAP/adjusted basis unspecified. Do not assume +1y EPS equals provider forward EPS.')
@@ -32,22 +53,26 @@ def enrich(data,stock,info,peer_symbols=()):
     for x in data['estimates']:
         if x.get('period') in ('0q','+1q') and not x.get('period_end'):
             x['period_end']=consensus_quarter_end(info,x['period']);x['period_end_approx']=True
-    fin_cur=financial_currency or currency
-    def fact(id_,value,category,period_end,basis,unit,src):
-        return dict(id=id_,value=value,category=category,source=src,currency=fin_cur,period_end=period_end,basis=basis,
+    fin_cur=(currency if fx.get('applied') else financial_currency) or currency
+    def fact(id_,value,category,period_end,basis,unit,src,convert=True,already_quote=False):
+        k=conv if (convert and not already_quote) else 1.0
+        note=(' '+fx['text']) if fx.get('applied') and (convert and not already_quote) else ''
+        out=dict(id=id_,value=value*k,category=category,source=src,currency=fin_cur,period_end=period_end,basis=basis+note,
                     published_at=None,retrieved_at=now,unit=unit,source_url=f"https://finance.yahoo.com/quote/{data['ticker']}/")
+        if fx.get('applied') and (not convert or k!=1.0): out['fx_from']=fx['from']
+        return out
     lead=[];rlead=[]
     q_end=to_date(info.get('mostRecentQuarter'))
     if num(info.get('trailingEps')) and q_end:
-        lead.append(fact('ttm',num(info['trailingEps']),'ttm_reported',q_end.isoformat(),'Trailing-twelve-month EPS to the latest reported quarter (provider field; GAAP/adjusted basis unverified)','currency_per_share',source))
+        lead.append(fact('ttm',num(info['trailingEps']),'ttm_reported',q_end.isoformat(),'Trailing-twelve-month EPS to the latest reported quarter (provider field; GAAP/adjusted basis unverified)'+(' The provider EPS already matches its own P/E in the quote currency, so it was not converted.' if fx.get('applied') and t_quote else ''),'currency_per_share',source,already_quote=t_quote))
     if num(info.get('totalRevenue')) and q_end:
         rlead.append(fact('revenue:ttm',num(info['totalRevenue']),'ttm_reported',q_end.isoformat(),'Trailing-twelve-month revenue to the latest reported quarter (provider field)','full_currency_units',source))
     for x in data['estimates']:
         if x.get('period') in ('0y','+1y') and x.get('period_end') and num(x.get('avg')) is not None:
             if x['metric']=='eps':
-                lead.append(fact('consensus:'+x['period'],x['avg'],'market_consensus',x['period_end'],'Analyst mean EPS for the fiscal year ending on this date (basis GAAP/adjusted unverified). Not reported.','currency_per_share',x['source']))
+                lead.append(fact('consensus:'+x['period'],x['avg'],'market_consensus',x['period_end'],'Analyst mean EPS for the fiscal year ending on this date (basis GAAP/adjusted unverified). Not reported.'+((' '+fx['text']) if fx.get('applied') else ''),'currency_per_share',x['source'],convert=False))
             else:
-                rlead.append(fact('revenue:consensus:'+x['period'],x['avg'],'market_consensus',x['period_end'],'Analyst mean revenue for the fiscal year ending on this date. Not reported.','full_currency_units',x['source']))
+                rlead.append(fact('revenue:consensus:'+x['period'],x['avg'],'market_consensus',x['period_end'],'Analyst mean revenue for the fiscal year ending on this date. Not reported.'+((' '+fx['text']) if fx.get('applied') else ''),'full_currency_units',x['source'],convert=False))
     order={'consensus:0y':0,'consensus:+1y':1}
     lead.sort(key=lambda a:(a['id']!='ttm',order.get(a['id'],9)))
     data['anchors']=lead+data['anchors']
@@ -68,9 +93,15 @@ def enrich(data,stock,info,peer_symbols=()):
         low=num(info.get('targetLowPrice')),high=num(info.get('targetHighPrice')),analysts=num(info.get('numberOfAnalystOpinions')),
         currency=currency,source=source,retrieved_at=now,published_at=None,horizon=None,
         basis='Provider analyst price targets; individual dates and target horizon unavailable; not this model result.')
-    data['market_baseline']=dict(currency=financial_currency,total_debt=num(info.get('totalDebt')),
-        total_cash=num(info.get('totalCash')),shares=shares_now,ebitda=num(info.get('ebitda')),
-        enterprise_value=num(info.get('enterpriseValue')),net_debt=None,source=source,retrieved_at=now,
+    def c_(v): return None if v is None else v*conv
+    ev_raw=num(info.get('enterpriseValue'));debt_c=c_(num(info.get('totalDebt')));cash_c=c_(num(info.get('totalCash')))
+    ev_pick=c_(ev_raw)
+    if fx.get('applied') and ev_raw and shares_now and price and debt_c is not None and cash_c is not None:
+        mk=price*shares_now+(debt_c-cash_c)      # which reading of the provider EV matches price × shares + net debt?
+        if abs(ev_raw/mk-1)<abs(ev_raw*conv/mk-1): ev_pick=ev_raw
+    data['market_baseline']=dict(currency=(currency if fx.get('applied') else financial_currency),total_debt=debt_c,
+        total_cash=cash_c,shares=shares_now,ebitda=c_(num(info.get('ebitda'))),
+        enterprise_value=ev_pick,net_debt=None,source=source,retrieved_at=now,
         balance_date=None,shares_date=None,basis='Latest available provider balance amounts and outstanding shares; not a target-date forecast. Balance dates unspecified.')
     b=data['market_baseline']
     if b['total_debt'] is not None and b['total_cash'] is not None: b['net_debt']=b['total_debt']-b['total_cash']
@@ -129,6 +160,11 @@ def enrich(data,stock,info,peer_symbols=()):
     pick,mm=pfcf_defaults(data,(data['method_fit'].get('p_fcf') or {}).get('use_after_sbc'))
     pf=data['defaults']['p_fcf'];pf['anchor_id']=pick['id'] if pick else None;pf['multiple_by_anchor']=mm
     pf['exit_multiple']=round(mm[pick['id']],1) if pick and pick['id'] in mm else None
+    if fx.get('applied'):
+        data['warnings'].append(fx['text'])
+        pe_t=num(info.get('trailingPE'));tt=next((x for x in data['anchors'] if x['id']=='ttm'),None)
+        if pe_t and tt and price and abs(price/tt['value']/pe_t-1)>.15: data['warnings'].append('The converted trailing EPS gives a P/E that differs from the provider P/E by more than 15%; check the currency of the provider EPS before relying on P/E.')
+    elif fx.get('needed'): data['warnings'].append('Quote and accounts are in different currencies and no exchange rate was available: '+str(fx.get('reason'))+'. Valuation methods that mix them are blocked.')
     data['multiple_context']={m:multiple_context(data,m) for m in ('pe','p_fcf','ev_ebitda')}
     return clean(data)
 

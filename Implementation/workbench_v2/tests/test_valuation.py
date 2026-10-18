@@ -22,7 +22,7 @@ def test_missing_or_loss_eps(data,value):
     with pytest.raises(ValueError):calculate(data,assumptions())
 def test_currency_mismatch(data):
     data['anchors'][0]['currency']='CAD'
-    with pytest.raises(ValueError,match='currencies'):calculate(data,assumptions())
+    with pytest.raises(ValueError,match='no exchange rate'):calculate(data,assumptions())
 def test_missing_quote(data):
     data['quote']['value']=None
     with pytest.raises(ValueError,match='price'):calculate(data,assumptions())
@@ -37,7 +37,7 @@ def test_no_mutation(data):
     old=copy.deepcopy(data);calculate(data,assumptions());assert data==old
 
 def test_api_append_only_and_offline_replay(tmp_path,monkeypatch,data):
-    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db');monkeypatch.setattr(api,'fetch',lambda _:data)
+    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db');monkeypatch.setattr(api,'fetch',lambda _,**k:data)
     app=FastAPI();app.include_router(api.router);client=TestClient(app)
     snap=client.post('/api/v1/valuation/TEST/fetch').json()
     req=dict(data_id=snap['id'],assumptions=assumptions().model_dump())
@@ -149,7 +149,7 @@ def test_consensus_bridge_not_quarter_annualization(data):
     assert 'error' in consensus_bridge(data,20,.1)['rows'][0]
 
 def test_api_second_method_and_references(tmp_path,monkeypatch,ev_data):
-    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db');monkeypatch.setattr(api,'fetch',lambda _:ev_data)
+    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db');monkeypatch.setattr(api,'fetch',lambda _,**k:ev_data)
     app=FastAPI();app.include_router(api.router);client=TestClient(app)
     snap=client.post('/api/v1/valuation/TEST/fetch').json()
     req=dict(data_id=snap['id'],assumptions=ev_assumptions().model_dump())
@@ -176,7 +176,7 @@ def test_reference_enrichment_with_stubbed_history(monkeypatch):
 def test_saved_market_comparison_replays(tmp_path,monkeypatch,data):
     monkeypatch.setattr(api,'DB',tmp_path/'valuation.db')
     data['estimates']=[dict(metric='eps',period='+1y',avg=4,currency='USD')]
-    monkeypatch.setattr(api,'fetch',lambda _:data)
+    monkeypatch.setattr(api,'fetch',lambda _,**k:data)
     app=FastAPI();app.include_router(api.router);client=TestClient(app)
     s=client.post('/api/v1/valuation/TEST/fetch').json()
     r=client.post('/api/v1/valuation/calculate',json=dict(data_id=s['id'],assumptions=assumptions().model_dump(),reference=dict(pe=25,spread=.1)))

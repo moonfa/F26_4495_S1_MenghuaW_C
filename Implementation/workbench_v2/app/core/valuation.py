@@ -87,7 +87,9 @@ def base_context(data,a,key):
     price=data['quote'].get('value')
     if not price or price<=0: raise ValueError('A positive observed price is required.')
     currency=data['quote'].get('currency')
-    if not currency or currency!=anchor.get('currency'): raise ValueError('Quote and financial anchor currencies must be known and identical.')
+    if not currency or currency!=anchor.get('currency'):
+        fx=data.get('fx') or {}
+        raise ValueError('The price is in %s but this figure is in %s, and no exchange rate was applied (%s). Import the data again, or pick a figure in %s.'%(currency or 'an unknown currency',anchor.get('currency') or 'an unknown currency',fx.get('reason') or 'none stored with this import',currency or 'the quote currency'))
     asof=date.fromisoformat(data['retrieved_at'][:10]);end=anniversary(asof,a.years)
     if a.growth-a.growth_spread<=-1: raise ValueError('Bear growth must exceed -100%.')
     # Growth is counted for exactly the holding period. The starting value and the exit multiple are on the same basis (trailing,
@@ -107,7 +109,7 @@ def outputs(data,a,anchor,price,currency,asof,end,gy,rows,reverse):
                 valuation_date=asof.isoformat(),exit_date=end.isoformat(),growth_years=gy,
                 anchor=anchor,assumptions=a.model_dump(),scenarios=rows,reverse=reverse,
                 required_exit_price=target,
-                limitations=['Price return excludes dividends, tax and fees.',
+                limitations=(['Reported figures in %s were converted to %s at one spot rate and the rate is held constant to the exit date, so a move in the exchange rate would change the result by about the same percentage.'%(anchor['fx_from'],currency)] if anchor.get('fx_from') else [])+['Price return excludes dividends, tax and fees.',
                   'Discounted terminal price is not a complete cash-flow valuation.',
                   'Bear/Base/Bull are user assumptions, not probabilities, bounds or analyst targets.',
                   'Growth is counted for exactly the holding period from the starting value. The exit multiple is read on the same basis as that starting value, so today\'s multiple on it (price ÷ starting value) adds nothing when held flat.'+(' Growth fades linearly from the starting rate to the fade rate by the exit date.' if getattr(a,'fade_to',None) is not None else ''),

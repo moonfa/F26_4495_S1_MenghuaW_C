@@ -1,4 +1,5 @@
-"""Append-only valuation storage, physically separate from research and Plan."""
+"""Valuation storage, physically separate from research and Plan. Records are never edited; the user may delete one.
+An import that no saved result uses is replaced when the same ticker is imported again."""
 from pathlib import Path
 from datetime import datetime, timezone
 import json, sqlite3, uuid, re
@@ -10,7 +11,7 @@ from ..core.valuation import Assumptions, EbitdaAssumptions, PfcfAssumptions, ca
 from ..adapters.valuation_adapter import fetch
 from ..adapters.valuation_references import SCHEMA
 from ..core.compare import compare as compare_rows
-from ..core.snapshots import history_rows
+from ..core.snapshots import history_rows, delete_record, prune_data
 
 ROOT=Path(__file__).resolve().parents[2]
 DB=ROOT/"valuation.db"
@@ -60,11 +61,24 @@ def load(ticker: str, req: FetchRequest | None = None):
     if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}",ticker): raise HTTPException(422,"Invalid ticker")
     peers=[s.strip().upper() for s in (req.peers if req else [])]
     if any(not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}",s) for s in peers): raise HTTPException(422,"Invalid peer ticker")
-    return save(ticker,"data",fetch(ticker,peer_symbols=list(dict.fromkeys(peers)),industry=bool(req and req.industry)))
+    rec=save(ticker,"data",fetch(ticker,peer_symbols=list(dict.fromkeys(peers)),industry=bool(req and req.industry)))
+    with connect() as c: prune_data(c,ticker)      # earlier imports that no saved result uses are replaced by this one
+    return rec
 
 @router.get("/api/v1/valuation/{ticker}/history")
 def history(ticker: str):
     with connect() as c: return history_rows(c,ticker,50)
+
+@router.delete("/api/v1/valuation/snapshots/{ident}")
+def delete_snapshot(ident: str):
+    with connect() as c: r=delete_record(c,ident)
+    if r=="missing": raise HTTPException(404,"Snapshot not found")
+    if r=="in_use": raise HTTPException(409,"Saved analyses or comparisons still use this imported data. Delete those first.")
+    return dict(deleted=ident)
+
+@router.post("/api/v1/valuation/{ticker}/cleanup")
+def cleanup(ticker: str):
+    with connect() as c: return dict(removed=prune_data(c,ticker))
 
 @router.get("/api/v1/valuation/snapshots/{ident}")
 def snapshot(ident: str): return read(ident,hydrate=True)

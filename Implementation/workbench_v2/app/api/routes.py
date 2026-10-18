@@ -127,9 +127,10 @@ def companies(session: Session = Depends(get_session)):
         q = _quote(snap.payload, c.ticker) if snap else {}
         out.append({"ticker": c.ticker, "name": c.name, "alias": broker.get(c.ticker), "status": c.status or "watching",
                     "view": anchor.view if anchor else None, "view_change": anchor.view_change if anchor else None,
-                    "price": q.get("price"), "target_upside_pct": q.get("target_upside_pct"),
+                    "price": q.get("price"), "currency": q.get("currency"), "target_upside_pct": q.get("target_upside_pct"),
                     "analysed_at": anchor.created_at if anchor else None, "checked_at": last.created_at if last else None,
-                    "sector": q.get("sector"), "plan_status": _pstat(plans.get(c.ticker), q.get("price"), held.get(c.ticker))})
+                    "sector": q.get("sector"), "pnl_pct": held[c.ticker].pnl_pct if c.ticker in held else None,
+                    "weight": held[c.ticker].weight if c.ticker in held else None, "plan_status": _pstat(plans.get(c.ticker), q.get("price"), held.get(c.ticker))})
     return out
 
 
@@ -269,7 +270,7 @@ def fundamentals(ticker: str, session: Session = Depends(get_session)):
     base = session.get(Snapshot, anchor.snapshot_id) if anchor else None
     keys = ("market", "valuation", "financial_health", "analyst_consensus")
     pick = lambda snap: {k: snap.payload.get(k) for k in keys} if snap else None
-    return {"as_of": latest.retrieved_at, "analysed_at": base.retrieved_at if base else None,
+    return {"as_of": latest.retrieved_at, "analysed_at": base.retrieved_at if base else None, "currency": _quote(latest.payload, c.ticker)["currency"],
             "now": pick(latest), "at_analysis": pick(base), "derived": signals.derived_metrics(latest.payload),
             "statements": statements_core.view(latest.payload.get("statements")) if latest.payload.get("statements") else None}
 

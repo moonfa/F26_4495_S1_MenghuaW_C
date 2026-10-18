@@ -27,6 +27,25 @@ def auto_peers(ticker, info, n=8):
         return syms,f'Yahoo top companies in "{info.get("industry")}"'
     except Exception as e: return [],f"Industry peers unavailable: {str(e)[:150]}"
 
+def fx_lookup(frm, to):
+    """Latest daily close of the Yahoo pair `frm``to`=X (e.g. CNYHKD=X); the inverse pair is used when the direct one is missing."""
+    try:
+        import yfinance as yf
+    except Exception:
+        return None
+    for a, b, inv in ((frm, to, False), (to, frm, True)):
+        try:
+            frame = yf.Ticker(f"{a}{b}=X").history(period="10d", auto_adjust=False, actions=False, timeout=15)
+            closes = frame["Close"].dropna()
+            if len(closes):
+                v = float(closes.iloc[-1])
+                if v > 0:
+                    return dict(rate=1 / v if inv else v, observed=str(closes.index[-1])[:10], pair=f"{a}{b}=X")
+        except Exception:
+            continue
+    return None
+
+
 def fetch(ticker, peer_symbols=(), industry=False):
     now=datetime.now(timezone.utc).isoformat()
     d=dict(ticker=ticker, retrieved_at=now, quote={}, anchors=[], estimates=[], historical=[], warnings=[], raw={})
@@ -146,6 +165,9 @@ def fetch(ticker, peer_symbols=(), industry=False):
         peer_symbols,d["peer_source"]=auto_peers(ticker,info)
         if not peer_symbols: d["warnings"].append(d["peer_source"])
     elif peer_symbols: d["peer_source"]="Peers you chose"
+    from ..core.fx import plan as fx_plan
+    fin=info.get("financialCurrency")
+    d["fx"]=fx_plan(fin,currency,fx_lookup) if (fin and currency and fin!=currency) else dict(applied=False,needed=False)
     return enrich(clean(d),stock,info,peer_symbols)
 
 

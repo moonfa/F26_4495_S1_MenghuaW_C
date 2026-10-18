@@ -59,8 +59,8 @@ def test_lifecycle(session):
     r4 = service.refresh(session, "tst", adapter=ad, provider=ai)
     assert r4.kind == "update" and r4.level == "material" and r4.prev_review_id == r1.id
 
-    # identical inputs -> cache hit, no new row
+    # the update is now the anchor, so identical inputs mean "nothing changed": a free check, no model call
     r5 = service.refresh(session, "tst", adapter=ad, provider=ai)
-    assert r5.id == r4.id
+    assert r5.kind == "check" and r5.provider == "none" and r5.prev_review_id == r4.id
 
 
