@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 import importlib
 
+from ..core import statements as statements_core
+
 
 class OpenBBAdapterError(RuntimeError):
     """Provider-independent error raised by the OpenBB adapter."""
@@ -171,7 +173,27 @@ class OpenBBAdapter:
                 symbol=ticker,
                 provider=self.provider,
                 period="annual",
-                limit=4,
+                limit=5,
+            ),
+        )
+
+        income_q = fetch(
+            "income_q",
+            lambda: obb.equity.fundamental.income(
+                symbol=ticker,
+                provider=self.provider,
+                period="quarter",
+                limit=8,
+            ),
+        )
+
+        cash_q = fetch(
+            "cash_q",
+            lambda: obb.equity.fundamental.cash(
+                symbol=ticker,
+                provider=self.provider,
+                period="quarter",
+                limit=8,
             ),
         )
 
@@ -181,7 +203,7 @@ class OpenBBAdapter:
                 symbol=ticker,
                 provider=self.provider,
                 period="annual",
-                limit=4,
+                limit=5,
             ),
         )
 
@@ -204,6 +226,8 @@ class OpenBBAdapter:
             income=income,
             cash=cash,
             news=news,
+            income_q=income_q,
+            cash_q=cash_q,
         )
 
         normalized["data_quality"] = {
@@ -237,6 +261,8 @@ class OpenBBAdapter:
         consensus: list[dict[str, Any]],
         income: list[dict[str, Any]],
         cash: list[dict[str, Any]],
+        income_q: list[dict[str, Any]] | None = None,
+        cash_q: list[dict[str, Any]] | None = None,
         news: list[dict[str, Any]],
     ) -> dict[str, Any]:
 
@@ -575,6 +601,10 @@ class OpenBBAdapter:
             "financial_health": financial_health,
             "analyst_consensus": analyst_consensus,
             "recent_news": recent_news,
+            "statements": {
+                "annual": statements_core.merge(income, cash, 5),
+                "quarterly": statements_core.merge(income_q or [], cash_q or [], 8),
+            },
         }
 
     # Backward-compatible profile normalization.
@@ -953,4 +983,6 @@ class OpenBBAdapter:
             ),
             cause=exc,
         )
+
+
 

@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from typing import Any
+
+from . import statements
 
 FUNDAMENTAL_SECTIONS = ("financial_health", "analyst_consensus")
 MULTIPLES = ("pe_ttm", "forward_pe", "peg", "price_to_sales", "price_to_book",
@@ -92,6 +95,10 @@ def compute_delta(cur: dict, prev: dict | None, th: Thresholds = Thresholds()) -
         elif abs(raw) >= th.valuation_minor:
             price_driven = True
 
+    q_old, q_new = statements.latest_quarter_end(prev.get("statements")), statements.latest_quarter_end(cur.get("statements"))
+    if q_old and q_new and q_new != q_old:          # a new quarter was reported (only when the anchor already had quarterly data)
+        fund.append({"metric": "statements.new_quarter", "old": q_old, "new": q_new, "pct": 0.0})
+
     old_t = set(news_titles(prev))
     fresh = [n for n in (cur.get("recent_news") or [])
              if isinstance(n, dict) and n.get("title") and str(n["title"]).strip() not in old_t]
@@ -125,8 +132,6 @@ def classify(delta: dict, th: Thresholds = Thresholds()) -> tuple[str, str]:
     soft = next((w for w in SOFT_NEWS if w in text), None)
     if soft:
         return "minor", f"News keyword: '{soft}'."
-    if len(delta.get("new_news") or []) >= 3:
-        return "minor", "Three or more new headlines."
     return "none", "No thesis-relevant change (price and multiple moves are explained by price)."
 
 
@@ -139,6 +144,9 @@ def fingerprint(evidence: dict) -> str:
             n = _num(v)
             if n is not None:
                 out[f"{sec}.{k}"] = float(f"{n:.3g}")
+    q = statements.latest_quarter_end(evidence.get("statements"))
+    if q:
+        out["statements.latest_quarter"] = q
     return hashlib.sha256(json.dumps(out, sort_keys=True).encode()).hexdigest()[:24]
 
 
@@ -153,6 +161,7 @@ def compact_evidence(evidence: dict, max_desc: int = 500) -> dict:
     e = dict(evidence)
     e.pop("data_quality", None)
     e.pop("schema_version", None)
+    e.pop("statements", None)                     # the model gets the code-computed quarterly_trend in `derived` instead
     comp = dict(e.get("company") or {})
     for k in ("company_url", "employees", "stock_exchange"):
         comp.pop(k, None)
@@ -160,4 +169,114 @@ def compact_evidence(evidence: dict, max_desc: int = 500) -> dict:
         comp["long_description"] = str(comp["long_description"])[:max_desc]
     e["company"] = comp
     e["recent_news"] = [{"date": n.get("date"), "title": n.get("title")} for n in (e.get("recent_news") or [])[:5]]
+    e["evidence_basis"] = evidence_basis(evidence)
+    e["data_gaps"] = data_gaps(evidence)
+    e["derived"] = derived_metrics(evidence)
     return clean(e)
+
+
+# ---------------------------------------------------------------------------
+# Evidence basis, data gaps and code-computed "what the price implies" metrics.
+# All arithmetic happens here; the model only interprets the results.
+# ---------------------------------------------------------------------------
+CYCLICAL_WORDS = ("memory", "semiconductor", "steel", "oil", "gas", "coal", "mining", "gold", "copper", "aluminum",
+                  "chemical", "auto manufacturers", "airline", "shipping", "marine", "homebuild", "building materials",
+                  "lumber", "paper", "agricultural", "farm", "equipment", "metals", "uranium", "solar")
+CYCLICAL_SECTORS = ("energy", "basic materials")
+STALE_DAYS = 380
+
+
+def _first_num(*vals):
+    for v in vals:
+        n = _num(v)
+        if n is not None:
+            return n
+    return None
+
+
+def _age_days(iso, today: date) -> int | None:
+    try:
+        return (today - date.fromisoformat(str(iso)[:10])).days
+    except ValueError:
+        return None
+
+
+def evidence_basis(ev: dict, now: datetime | None = None) -> dict:
+    """What period each block of evidence covers. Ratios have no period tag in the source (TTM / latest reported);
+    statement rows do, and they can lag the ratios right after earnings."""
+    today = (now or datetime.now(timezone.utc)).date()
+    fh = ev.get("financial_health") or {}
+    inc = fh.get("income_statement_latest") or {}
+    cfh = fh.get("cash_flow_history") or []
+    ends = [x for x in (inc.get("period_ending"), (cfh[0] or {}).get("period_ending") if cfh else None) if x]
+    age = _age_days(max(ends), today) if ends else None
+    out = {"retrieved": today.isoformat(),
+           "ratios": "TTM or latest reported (Yahoo Finance via OpenBB); the source gives no period label",
+           "statements": {"period_end": inc.get("period_ending"), "fiscal_year": inc.get("fiscal_year"),
+                          "fiscal_period": inc.get("fiscal_period"), "age_days": age,
+                          "stale": bool(age is not None and age > STALE_DAYS)}}
+    qe = statements.latest_quarter_end(ev.get("statements"))
+    if qe:
+        out["latest_reported_quarter"] = qe
+    if cfh:
+        out["cash_flow_history"] = "annual fiscal years " + ", ".join(str(r.get("fiscal_year") or r.get("period_ending")) for r in cfh[:4])
+    return out
+
+
+def data_gaps(ev: dict, now: datetime | None = None) -> list[str]:
+    gaps = []
+    b = evidence_basis(ev, now)
+    if b["statements"]["stale"]:
+        gaps.append(f"Statement rows end {b['statements']['period_end']} ({b['statements']['age_days']} days old) while ratios are newer "
+                    "(TTM); do not combine figures across the two.")
+    if not (ev.get("recent_news") or []):
+        gaps.append("No news returned by the data source.")
+    if not any(_num(v) is not None for v in (ev.get("analyst_consensus") or {}).values()):
+        gaps.append("No analyst consensus data.")
+    if not any(_num(v) is not None for v in (ev.get("financial_health") or {}).values()):
+        gaps.append("No financial-health ratios.")
+    return gaps
+
+
+def is_cyclical(ev: dict) -> str | None:
+    co = ev.get("company") or {}
+    text = f"{co.get('industry') or ''} {co.get('sector') or ''}".lower()
+    hit = next((w for w in CYCLICAL_WORDS if w in text), None) or next((w for w in CYCLICAL_SECTORS if w in text), None)
+    return hit
+
+
+def derived_metrics(ev: dict) -> dict:
+    """Simple ratios computed from fields we already hold. No forecasts are invented."""
+    m, v, fh = ev.get("market") or {}, ev.get("valuation") or {}, ev.get("financial_health") or {}
+    cap = _num(m.get("market_cap"))
+    cfh = fh.get("cash_flow_history") or []
+    fcf = _first_num(fh.get("free_cash_flow"), (cfh[0] or {}).get("free_cash_flow") if cfh else None)
+    fy = (cfh[0] or {}).get("fiscal_year") if cfh else None
+    ev_val = _first_num(v.get("enterprise_value"), m.get("enterprise_value"))
+    pe, fpe = _num(v.get("pe_ttm")), _num(v.get("forward_pe"))
+    out: dict = {}
+    if cap and fcf is not None:
+        out["fcf_yield"] = {"value": round(fcf / cap, 4), "basis": f"FCF {'FY' + str(fy) if fy else 'latest'} / market cap"}
+    if ev_val and fcf:
+        out["ev_to_fcf"] = {"value": round(ev_val / fcf, 1), "basis": "enterprise value / latest annual FCF"}
+    if pe and pe > 0:
+        out["earnings_yield_ttm"] = {"value": round(1 / pe, 4), "basis": "1 / P/E (TTM)"}
+    if fpe and fpe > 0:
+        out["earnings_yield_forward"] = {"value": round(1 / fpe, 4), "basis": "1 / forward P/E (consensus)"}
+    if pe and fpe and pe > 0 and fpe > 0:
+        out["consensus_implied_eps_change"] = {"value": round(pe / fpe - 1, 3),
+            "basis": "TTM P/E divided by forward P/E at one price: analysts expect forward EPS to differ from TTM EPS by this much (derived)"}
+    if pe and fpe and pe > 0 and fpe > 0 and (pe / fpe - 1 >= 0.5 or pe / fpe - 1 <= -0.33):
+        chg = pe / fpe - 1
+        out["earnings_dislocation"] = {"value": round(chg, 3), "kind": "recovery_expected" if chg > 0 else "decline_expected",
+            "caution": "Trailing and forward EPS differ a lot, so the price reflects analyst numbers, not trailing ones, and trailing multiples are distorted. "
+                       "A recovery or decline is an assumption to test with evidence, not a fact. Analyst EPS is usually adjusted; reported EPS includes one-offs."}
+    qt = statements.quarterly_trend(ev.get("statements"))
+    if qt:
+        out["quarterly_trend"] = qt
+    hit = is_cyclical(ev)
+    if hit:
+        out["cyclical_flag"] = {"matched": hit, "caution": "Cyclical industry: a low P/E can mean peak earnings. Judge on mid-cycle earnings, not spot."}
+    return out
+
+
