@@ -1,18 +1,13 @@
+"""Dates, one-off flags, defaults and the extreme-multiple rule (valuation-v4), on offline company fixtures."""
 import unittest
-from app.core.valuation_context import consensus_period_end, earnings_quality_flags, status_quo, to_date
-from app.core.valuation import Assumptions, EbitdaAssumptions, calculate
+
+from app.core.valuation_context import consensus_period_end, earnings_quality_flags, to_date, meaningful
+from app.core.valuation import Assumptions, calculate
+from tests.fixtures_val import company
 
 
-def data():
-    return dict(retrieved_at='2026-10-11T00:00:00+00:00', quote=dict(value=111.35, currency='USD'),
-                anchors=[dict(id='ttm', value=2.9, currency='USD', period_end='2026-09-21'),
-                         dict(id='annual:2026-01-31', value=2.73, currency='USD', period_end='2026-01-31')],
-                estimates=[dict(metric='eps', period='0y', avg=2.89), dict(metric='eps', period='+1y', avg=3.22)],
-                historical=[], current_multiples=dict(forward_pe=34.5, trailing_eps=2.9))
-
-
-def pe(anchor, **kw):
-    base = dict(anchor_id=anchor, years=3, required_return=.1, growth=.114, exit_pe=34.5, growth_spread=.03, pe_spread=.1, acknowledge_basis=True)
+def pe(**kw):
+    base = dict(exit_fy='2029-12-31', required_return=.1, growth=.114, exit_pe=20, growth_spread=.03, pe_spread=.1)
     return Assumptions(**{**base, **kw})
 
 
@@ -29,56 +24,54 @@ class Ctx(unittest.TestCase):
         rows[0]['net_income'] = 10
         self.assertEqual(earnings_quality_flags(rows), [])
 
-    def test_status_quo(self):
-        d = data(); d['historical'] = []
-        q = status_quo(d)
-        self.assertEqual(q['pe']['growth'], 11.4)
-        self.assertEqual(q['pe']['anchor_id'], 'ttm'); self.assertAlmostEqual(q['pe']['exit_pe'], 111.35 / 2.9, 1)   # price ÷ the same starting value
+    def test_defaults_start_from_the_analysts_and_this_years_multiple(self):
+        d = company(price=50.0)
+        q = d['defaults']['pe']
+        self.assertAlmostEqual(q['growth'], (2.5 / 2.2 - 1) * 100, places=1)       # growth the analyst numbers end on
+        self.assertEqual(q['growth_source'], 'eps_e1'); self.assertEqual(q['multiple_on'], 'E0')
+        self.assertAlmostEqual(q['exit_pe'], 50 / 2.2, places=1)                  # price ÷ this year's analyst EPS
+        self.assertEqual(q['fade_to'], 5.0)
 
-    def test_growth_counted_for_the_holding_period_only(self):
-        a = calculate(data(), pe('annual:2026-01-31')); t = calculate(data(), pe('ttm'))
-        self.assertEqual(a['growth_years'], 3); self.assertEqual(t['growth_years'], 3)
+    def test_no_analysts_falls_back_to_the_trailing_figure(self):
+        d = company(est=None)
+        q = d['defaults']['pe']
+        self.assertEqual(q['multiple_on'], 'TTM'); self.assertAlmostEqual(q['exit_pe'], 44 / 2.1, places=1)
+        self.assertEqual(q['growth_source'], 'eps_last')
 
-    def test_same_basis_multiple_adds_nothing(self):
-        """Hold today's multiple on the starting value and grow at g: the annual return is g for every starting point."""
-        d = data(); d['anchors'].append(dict(id='consensus:+1y', value=3.22, currency='USD', period_end='2028-02-01', category='market_consensus'))
-        for anchor, value in (('ttm', 2.9), ('annual:2026-01-31', 2.73), ('consensus:+1y', 3.22)):
-            r = calculate(d, pe(anchor, growth=.08, exit_pe=111.35 / value, growth_spread=0.0, pe_spread=0.0))
-            base = r['scenarios'][1]
-            self.assertAlmostEqual(base['price_cagr'], .08, places=9)
-            self.assertAlmostEqual(base['earnings_effect'], .08, places=9); self.assertAlmostEqual(base['multiple_effect'], 0, places=9)
+    def test_holding_a_same_basis_multiple_adds_nothing_when_the_exit_is_an_analyst_year(self):
+        """Hold today's multiple on this year's figure and exit in the next analyst year: the return is the analysts' growth, no more."""
+        d = company()
+        e0, e1 = 2.2, 2.5
+        r = calculate(d, pe(exit_fy='2027-12-31', exit_pe=44 / e0, pe_spread=0.0, growth_spread=0.0))
+        base = r['scenarios'][1]
+        self.assertEqual(r['user_years'], 0)
+        self.assertAlmostEqual(base['future_price'], 44 / e0 * e1)
+        self.assertTrue(any('analyst year' in c['text'] for c in r['checks']))
 
-    def test_stale_annual_anchor_warns(self):
-        d = data(); d['retrieved_at'] = '2027-10-11T00:00:00+00:00'
-        r = calculate(d, pe('annual:2026-01-31', exit_pe=111.35 / 2.73))
-        self.assertTrue(any(c['level'] == 'warn' and 'months ago' in c['text'] for c in r['checks']))
-
-    def test_growth_factor_fractional_tail(self):
-        from app.core.valuation import growth_factor
-        self.assertAlmostEqual(growth_factor(.2, .05, 1.01), 1.2 * 1.05 ** .01)
-        self.assertAlmostEqual(growth_factor(.1, .1, 2.5), 1.1 ** 2.5)
-
-    def test_status_quo_prefers_analyst_year(self):
-        d = data(); d['anchors'] = [dict(id='ttm', value=3.12, currency='USD'), dict(id='consensus:0y', value=6.72, currency='USD'), dict(id='consensus:+1y', value=7.19, currency='USD')]
-        d['quote']['value'] = 86.73
-        q = status_quo(d)['pe']
-        self.assertEqual(q['anchor_id'], 'consensus:+1y'); self.assertAlmostEqual(q['exit_pe'], 12.1, 1)
-        self.assertAlmostEqual(q['multiple_by_anchor']['ttm'], 27.8, 1)
+    def test_exit_date_and_fractional_years(self):
+        d = company()
+        r = calculate(d, pe())
+        self.assertEqual(r['exit_date'], '2029-12-31'); self.assertEqual(r['exit_fy'], 'FY2029')
+        self.assertAlmostEqual(r['years'], (to_date('2029-12-31') - to_date('2026-10-11')).days / 365.25)
+        self.assertNotEqual(r['years'], round(r['years']))
 
     def test_extreme_today_multiple_is_not_prefilled(self):
-        """INTC-type case: a tiny trailing base gives a P/E far above any sensible exit multiple. It must not become the default."""
-        d = data(); d['anchors'] = [dict(id='ttm', value=0.05, currency='USD')]; d['quote']['value'] = 40.0
-        q = status_quo(d)['pe']
+        """INTC-type case: a tiny base gives a P/E far above any sensible exit multiple. It must not become the default."""
+        d = company(price=40.0, est=(.03, .04, 1100e6, 1210e6), ttm_eps=.03)
+        q = d['defaults']['pe']
         self.assertIsNone(q['exit_pe']); self.assertIn('too large', q['multiple_note'])
-        self.assertAlmostEqual(q['multiple_by_anchor']['ttm'], 800.0, 1)   # still shown in the reference table
-        from app.core.valuation_context import meaningful
         self.assertTrue(meaningful('p_fcf', 40) and not meaningful('p_fcf', 1230.89) and not meaningful('ev_ebitda', 0))
 
     def test_checks_warn(self):
-        r = calculate(data(), pe('ttm', exit_pe=60))
-        self.assertTrue(any(c['level'] == 'warn' and 'starting point' in c['text'] for c in r['checks']))
-        r = calculate(data(), pe('ttm', growth=.4))
-        self.assertTrue(any('analyst' in c['text'] for c in r['checks']))
+        r = calculate(company(), pe(exit_pe=60))
+        self.assertTrue(any(c['level'] == 'warn' and 'multiple expansion' in c['text'] for c in r['checks']))
+        r = calculate(company(), pe(growth=.4))
+        self.assertTrue(any('analysts' in c['text'] and c['level'] == 'warn' for c in r['checks']))
+
+    def test_old_data_warns(self):
+        d = company(valuation='2027-10-11', next_fy='2027-12-31')
+        r = calculate(d, pe(exit_fy='2030-12-31'))
+        self.assertTrue(any(c['level'] == 'warn' and 'months ago' in c['text'] for c in r['checks']))
 
 
 if __name__ == '__main__':

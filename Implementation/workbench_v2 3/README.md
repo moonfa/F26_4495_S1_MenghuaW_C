@@ -1,5 +1,7 @@
 # Personal Investment Workbench v2
 
+The project overview, a step-by-step demo and the short install steps are in the repository's top-level `README.md`. This file has the detail.
+
 A local, single-user research tool that tracks an investment **thesis** per company over time (instead of regenerating one-off reports), keeps your holdings, position plans, trade reasons and journal in one place, and includes a **valuation lab** that shows what a price implies.
 
 - Runs on your own computer. Your data stays in two local SQLite files. There is no login, so the server must only listen on `127.0.0.1`.
@@ -19,7 +21,7 @@ A local, single-user research tool that tracks an investment **thesis** per comp
 | **Companies** | One thesis per company: Brief, Position & plan, Thesis (assumptions with status and kill criteria), Valuation, Fundamentals (quarterly and annual statements), Timeline, Notes. Refresh makes a baseline, an update, or a free "no change" check. | Only for baseline and update text |
 | **Portfolio** | Import holdings and trades from a Futu CSV; weights, plans with buy / target / stop prices and position sizes; trade reasons and outcomes by strategy. | No |
 | **Journal and Calendar** | Portfolio-level diary with a code-built review checklist; month, week and list calendar of trades, reviews and revisit dates. | No |
-| **Valuation lab** | Compare tickers, or open one company: starting point from reported or analyst numbers, exit multiple, annual return, "what you must believe" grid, saved snapshots (deletable). Linked to the company page: out-of-date flags, return at your Plan price, assumption-to-valuation-input links, a question saved to Notes. | No |
+| **Valuation lab** | Compare tickers, or open one company: one period table (reported years, TTM, analyst years, your years), exit at a fiscal year end, exit multiple, annual return, "what you must believe" grid, notice when analyst estimates change, a "read this first" block with exit-multiple lenses, saved snapshots (deletable). Linked to the company page: out-of-date flags, return at your Plan price, assumption-to-valuation-input links, a question saved to Notes. | No |
 | **Chinese on demand** | Analysis text can be translated; the valuation lab has an English / 中文 switch for its explanations and Guide. | Translation only |
 | **Security** | Local-only: Host and Origin checks, security headers, http(s)-only links, no secrets in the browser. | No |
 
@@ -38,8 +40,8 @@ A local, single-user research tool that tracks an investment **thesis** per comp
 These steps are needed because the repository deliberately does **not** contain your environment, your API key or your data (`.gitignore` excludes `.env`, `*.db` and `.venv/`).
 
 ```bash
-git clone <your-repository-url>
-cd <repository-folder>          # the folder that contains app/ and requirements.txt
+git clone https://github.com/moonfa/F26_4495_S1_MenghuaW_C.git
+cd F26_4495_S1_MenghuaW_C/Implementation/workbench_v2     # the folder that contains app/ and requirements.txt
 
 # 1. Create an isolated environment and install the packages (pip needs a few minutes the first time)
 python3 -m venv .venv

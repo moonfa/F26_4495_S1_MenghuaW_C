@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from app.core import fx as F
 from app.adapters.valuation_references import enrich
 from app.core.valuation import Assumptions, calculate
+from app.core.period_table import table_of
 
 
 def ts(y, m, d):
@@ -72,14 +73,14 @@ class Converted(unittest.TestCase):
         self.assertAlmostEqual(self.d['current_multiples']['price_to_fcf'], 23.96 / per_share, places=2)
 
     def test_calculation_runs_and_says_so(self):
-        a = Assumptions(anchor_id='consensus:0y', years=3, required_return=.1, growth=-.05, fade_to=.0, exit_pe=7.0, growth_spread=.03, pe_spread=.1, acknowledge_basis=True)
+        a = Assumptions(exit_fy='2028-12-31', required_return=.1, growth=-.05, fade_to=.0, exit_pe=7.0, growth_spread=.03, pe_spread=.1)
         r = calculate(self.d, a)
         self.assertEqual(r['currency'], 'HKD')
         self.assertTrue(any('exchange rate' in x for x in r['limitations']))
 
     def test_without_a_rate_the_error_says_what_to_do(self):
         d = company(F.plan('CNY', 'EUR', lookup))
-        a = Assumptions(anchor_id='consensus:0y', years=3, required_return=.1, growth=0, exit_pe=7.0, growth_spread=.03, pe_spread=.1, acknowledge_basis=True)
+        a = Assumptions(exit_fy='2028-12-31', required_return=.1, growth=0, exit_pe=7.0, growth_spread=.03, pe_spread=.1)
         with self.assertRaises(ValueError) as e:
             calculate(d, a)
         self.assertIn('Import the data again', str(e.exception))

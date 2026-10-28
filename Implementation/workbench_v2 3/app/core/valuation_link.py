@@ -7,6 +7,7 @@ or a saved valuation, and none of it is sent to a model."""
 from datetime import datetime, timezone
 
 from .compare import ticker_row
+from .period_table import table_of, fy_label
 
 # What a thesis assumption can be tied to. The user chooses; the program never guesses a link.
 DRIVERS = {
@@ -24,6 +25,8 @@ METHOD_LABEL = {'pe': 'P/E', 'p_fcf': 'P/FCF', 'ev_ebitda': 'EV/EBITDA'}
 WEAK = ('weakened', 'broken')
 PRICE_MOVE = 0.15      # a saved valuation is stale when the price has moved this much since its data was fetched
 DATA_DAYS = 100        # about a quarter: new results have probably been reported since
+EPS_REVISION = 0.03    # analyst EPS for a saved year has moved this much since the analysis was saved
+REVENUE_REVISION = 0.02
 
 
 def _dt(v):
@@ -44,7 +47,7 @@ def at_price(result, entry):
     """What the saved Base path would return if you paid `entry`, and the most you could pay for the required return."""
     base, bear, bull = _sc(result, 'Base'), _sc(result, 'Bear'), _sc(result, 'Bull')
     a = result.get('assumptions') or {}
-    years, req = a.get('years'), a.get('required_return')
+    years, req = result.get('years'), a.get('required_return')
     if not base or not years or req is None:
         return None
     fp = base['future_price']
@@ -65,8 +68,8 @@ def analysis_row(rec, price_now, plan, today):
         return None
     anchor = res.get('anchor') or {}
     mult = a.get('exit_pe') if m == 'pe' else a.get('exit_multiple')
-    row = dict(method=m, label=METHOD_LABEL.get(m, m), analysis_id=rec.get('id'), saved_at=rec.get('created_at'), years=a.get('years'),
-               required_return=a.get('required_return'), anchor_id=a.get('anchor_id'), anchor_kind=anchor.get('category'),
+    row = dict(method=m, label=METHOD_LABEL.get(m, m), analysis_id=rec.get('id'), saved_at=rec.get('created_at'), years=res.get('years'), exit_fy=res.get('exit_fy'),
+               required_return=a.get('required_return'), anchor_id=anchor.get('id'), anchor_kind=anchor.get('category'), estimates_used=res.get('estimates_used'), diag=(res.get('diagnosis') or {}).get('level'),
                anchor_end=anchor.get('period_end'), anchor_value=anchor.get('value'), growth=a.get('growth'), fade_to=a.get('fade_to'),
                exit_multiple=mult, bear=bear and bear['price_cagr'], base=base['price_cagr'], bull=bull and bull['price_cagr'],
                base_price=base['future_price'], exit_date=res.get('exit_date'), warnings=sum(1 for c in res.get('checks') or [] if c.get('level') == 'warn'),
@@ -80,7 +83,47 @@ def analysis_row(rec, price_now, plan, today):
     return row
 
 
-def stale_reasons(row, price_now, reviews, assumptions, drivers, today):
+def estimate_changes(used, table):
+    """What the analysts' numbers did since an analysis was saved. `used` = the estimates stored with it (by fiscal year end);
+    `table` = the period table of the newest import. Facts only: nothing here changes a saved analysis."""
+    out = []
+    if not used or not table:
+        return out
+    cols = [(c, to_day(c['period_end'])) for c in table['columns'] if c['kind'] in ('analyst', 'actual')]
+    for metric, thr in (('eps', EPS_REVISION), ('revenue', REVENUE_REVISION)):
+        for end, old in (used.get(metric) or {}).items():
+            d0 = to_day(end)
+            hit = next(((c, d) for c, d in cols if d0 and d and abs((d - d0).days) <= 20 and (table['rows'].get(metric) or {}).get(c['key'])), None)
+            if not hit or not old or old <= 0:
+                continue
+            cell = table['rows'][metric][hit[0]['key']]
+            ch = cell['value'] / old - 1
+            out.append(dict(metric=metric, fy=fy_label(end), period_end=end, old=old, new=cell['value'], change=ch,
+                            reported=hit[0]['kind'] == 'actual', material=abs(ch) >= thr or hit[0]['kind'] == 'actual'))
+    return out
+
+
+def to_day(v):
+    d = _dt(v)
+    return d.date() if d else None
+
+
+def estimate_text(changes):
+    """One factual line about the changes above, or None when nothing crossed a threshold."""
+    parts = []
+    for c in changes:
+        if not c['material']:
+            continue
+        name = 'EPS' if c['metric'] == 'eps' else 'revenue'
+        f = (lambda v: f'{v:,.2f}') if c['metric'] == 'eps' else (lambda v: f'{v / 1e9:,.2f}bn' if abs(v) >= 1e9 else f'{v / 1e6:,.0f}m')
+        if c['reported']:
+            parts.append(f'{c["fy"]} {name} is now reported at {f(c["new"])} (the saved analysis used an estimate of {f(c["old"])}, {c["change"] * 100:+.1f}%)')
+        else:
+            parts.append(f'analyst {name} for {c["fy"]} moved from {f(c["old"])} to {f(c["new"])} ({c["change"] * 100:+.1f}%)')
+    return ('Since this was saved: ' + '; '.join(parts) + '. The saved analysis was not changed.') if parts else None
+
+
+def stale_reasons(row, price_now, reviews, assumptions, drivers, today, table=None):
     """Plain reasons a saved valuation may no longer describe the company. Facts only; it never changes the saved numbers."""
     out = []
     saved = _dt(row.get('saved_at'))
@@ -96,6 +139,14 @@ def stale_reasons(row, price_now, reviews, assumptions, drivers, today):
     fetched = _dt(row.get('data_fetched'))
     if fetched and (today - fetched).days > DATA_DAYS:
         out.append(dict(kind='data', text=f'The data is {(today - fetched).days} days old; a new quarter has probably been reported. Import again.'))
+    used = row.get('estimates_used')
+    if used and table:
+        txt = estimate_text(estimate_changes(used, table))
+        if txt:
+            out.append(dict(kind='estimates', text=txt))
+        newest = (table['rows'].get('eps', {}).get('A0') or table['rows'].get('revenue', {}).get('A0') or {}).get('period_end')
+        if used.get('last_actual_end') and newest and newest > used['last_actual_end']:
+            out.append(dict(kind='fy', text=f'{fy_label(newest)} has been reported since this was saved, so the starting year and the analyst years have moved. Run the analysis again.'))
     mine = METHOD_DRIVERS.get(row.get('method'), ())
     stat = {a['id']: a for a in assumptions or []}
     weak = [stat[i] for i, d in (drivers or {}).items() if d in mine and i in stat and stat[i].get('status') in WEAK]
@@ -141,11 +192,11 @@ def summarize(data_rec, analyses, price_now, reviews, assumptions, drivers, plan
         r = analysis_row(rec, price_now, plan, today)
         if r and r['method'] not in seen:
             seen.add(r['method'])
-            r['stale'] = stale_reasons(r, price_now, reviews, assumptions, drivers, today)
+            r['stale'] = stale_reasons(r, price_now, reviews, assumptions, drivers, today, table_of(d))
             rows.append(r)
     try:
         sq = ticker_row(d, 3, 0.10, 0.0, 0.05)
-        status_quo = dict(years=3, required_return=0.10, fade_to=0.05, methods=[dict(method=m['method'], label=m['label'], base=m['base'], bear=m['bear'], bull=m['bull'],
+        status_quo = dict(years=sq.get('years') or 3, exit_fy=sq.get('exit_fy'), required_return=0.10, fade_to=0.05, methods=[dict(method=m['method'], label=m['label'], base=m['base'], bear=m['bear'], bull=m['bull'],
                           note=m['note'], implausible=m['implausible']) for m in sq['methods']], review=sq['review'])
     except (ValueError, OverflowError, KeyError, TypeError):
         status_quo = None

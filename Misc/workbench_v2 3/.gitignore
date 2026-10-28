@@ -1,0 +1,11 @@
+.env
+*.db
+*.bak
+__pycache__/
+.venv/
+local_backups/
+.DS_Store
+.pytest_cache/
+.idea/
+.vscode/
+*.zip

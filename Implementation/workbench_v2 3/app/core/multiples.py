@@ -57,27 +57,38 @@ def peer_values(data, method):
 
 
 def _today_points(data, method):
-    """'Today' rows: price divided by each starting value the method can use, so every row says what the market pays on THAT number."""
-    d = data.get('defaults') or {}
-    key = {'pe': 'pe', 'p_fcf': 'p_fcf'}.get(method)
-    mm = (d.get(key) or {}).get('multiple_by_anchor') or {} if key else {}
-    ends = {a['id']: a.get('period_end') for a in (data.get('anchors') or []) + (data.get('fcf_anchors') or [])}
+    """'Today' rows: price divided by each figure the method can use, so every row says what the market pays on THAT number. The row
+    that matches the default exit multiple is marked, and the exit multiple is trailing, so it is read on a fiscal-year figure."""
+    from .period_table import table_of, fy_label
+    t = table_of(data)
+    price = (data.get('quote') or {}).get('value')
+    cols = {c['key']: c for c in t['columns']}
     out = []
-    if method == 'pe':
-        for i, label, basis in (('ttm', 'Today · on trailing EPS', 'Price ÷ the last twelve months of reported EPS'),
-                                ('consensus:0y', 'Today · on this year\'s analyst EPS', 'Price ÷ analyst EPS for the year to {end}'),
-                                ('consensus:+1y', 'Today · on next year\'s analyst EPS', 'Price ÷ analyst EPS for the year to {end}')):
-            if i in mm:
-                out.append(dict(key='today', anchor=i, label=label, low=mm[i], high=mm[i],
-                                basis=basis.format(end=ends.get(i) or 'that year') + '. Use the row that matches your starting point: holding it flat adds nothing from the multiple.'))
-    elif method == 'p_fcf':
-        for i, label in (('fcf:ttm', 'Today · before stock compensation'), ('fcfsbc:ttm', 'Today · after stock compensation')):
-            if i in mm:
-                out.append(dict(key='today', anchor=i, label=label, low=mm[i], high=mm[i], basis='Price ÷ trailing free cash flow per share on this basis. Use the row that matches your starting point.'))
+
+    def add(label, mult, basis, which):
+        if mult and mult > 0:
+            out.append(dict(key='today', which=which, label=label, low=mult, high=mult, basis=basis))
+    if method in ('pe', 'p_fcf'):
+        row = 'eps' if method == 'pe' else 'fcf_per_share'
+        noun = 'EPS' if method == 'pe' else 'free cash flow per share'
+        for which, label in (('TTM', 'Today · on trailing ' + noun), ('E0', 'Today · on this year\'s ' + noun), ('E1', 'Today · on next year\'s ' + noun)):
+            c = (t['rows'].get(row) or {}).get(which)
+            if c and c['value'] > 0 and price:
+                end = c['period_end']
+                what = 'the last twelve months to ' + end if which == 'TTM' else (fy_label(end) + (' (derived from analyst revenue)' if c.get('derived') else ' (analyst mean)'))
+                add(label + (' · ' + fy_label(end) if which != 'TTM' else ''), price / c['value'], f'Price ÷ {noun} for {what}.', which)
+    else:
+        b = data.get('market_baseline') or {}
+        ev, margin = b.get('enterprise_value'), t.get('margin_default')
+        rev0 = (t['rows'].get('revenue') or {}).get('E0')
+        if ev and ev > 0 and rev0 and margin and margin > 0:
+            add('Today · on this year\'s EBITDA · ' + fy_label(rev0['period_end']), ev / (rev0['value'] * margin), 'Enterprise value ÷ analyst revenue × the latest EBITDA margin (derived).', 'E0')
+        cur = (data.get('current_multiples') or {}).get('enterprise_to_ebitda')
+        add('Today · on trailing EBITDA (provider)', cur, 'Provider enterprise value ÷ trailing EBITDA.', 'TTM')
     if not out:
         cur = current_multiple(data, method)
         if cur:
-            out.append(dict(key='today', anchor=None, label='Today', low=cur, high=cur, basis='What the market pays now (default exit multiple)'))
+            out.append(dict(key='today', which=None, label='Today', low=cur, high=cur, basis='What the market pays now (default exit multiple)'))
     return out
 
 
@@ -149,7 +160,16 @@ def method_fit(data):
         mark('ev_ebitda', 'caution', 'Cyclical industry: EBITDA swings with the cycle and ignores heavy capital spending.')
         out['p_fcf']['reasons'].append('Cash flow is also cyclical, but it already nets out heavy capital spending, so it is the steadier base here.')
     if (num(cm.get('trailing_eps')) or 0) <= 0:
-        mark('pe', 'avoid', 'Trailing EPS is zero or negative.')
+        from .period_table import table_of as _t, series as _s
+        try:
+            _s(_t(data), 'pe')
+            positive_ahead = any(k['key'] != 'A0' for k in _s(_t(data), 'pe')['known'])
+        except ValueError:
+            positive_ahead = False
+        if positive_ahead:
+            mark('pe', 'caution', 'Trailing EPS is zero or negative. The calculation starts from the analysts\' positive years, so the result is a bet that the recovery happens; read "what the price already asks for".')
+        else:
+            mark('pe', 'avoid', 'Trailing EPS is zero or negative.')
     for f in flags:
         mark('pe', 'caution', 'Reported earnings look unusual versus prior years (possible one-off).')
         break
@@ -177,6 +197,13 @@ def method_fit(data):
     sc = data.get('share_check') or {}
     if sc.get('differs'):
         mark('p_fcf', 'caution', 'Provider share count and market cap / price differ by more than 25% (share classes or ADR ratio); per-share cash flow is approximate.')
+    from .period_table import table_of, series
+    tbl = table_of(data) if (data.get('historical') or data.get('estimates') or data.get('period_table')) else None
+    for m, what in (() if tbl is None else (('pe', 'earnings per share'), ('p_fcf', 'free cash flow per share'), ('ev_ebitda', 'revenue'))):
+        try:
+            series(tbl, m)
+        except ValueError:
+            mark(m, 'avoid', f'No positive {what} to project from: the last reported year is not positive and the analysts give no positive year.')
     order = ('p_fcf', 'pe', 'ev_ebitda') if cyc else ('pe', 'p_fcf', 'ev_ebitda')
     good = [m for m in order if out[m]['level'] == 'fit'] or [m for m in order if out[m]['level'] == 'caution']
     rec = good[0] if good else None

@@ -33,7 +33,7 @@ def _models(raw: str) -> list[str]:
 
 AI_MODEL_FALLBACKS = _models(os.getenv("AI_MODEL_FALLBACKS", ""))   # tried in order when a model is out of quota
 
-APP_VERSION = "2.28.1-highlight"
+APP_VERSION = "2.29.1-read-first"
 
 # Keep provider caches/settings in this independent copy, not in the user's home.
 from pathlib import Path

@@ -2,9 +2,11 @@
 from datetime import date,datetime,timezone
 from ..core.fx import conv_rows,conv_estimates
 from ..core.multiples import multiple_context,method_fit
-from ..core.valuation_context import meaningful,withheld_note,num,ratio,historical_pe,to_date,consensus_period_end,earnings_quality_flags,status_quo,fcf_anchors,pfcf_defaults,earnings_dislocation,industry_summary,consensus_quarter_end,growth_refs
+from ..core.period_table import build_period_table
+from ..core.valuation_defaults import build_defaults,growth_refs
+from ..core.valuation_context import meaningful,withheld_note,num,ratio,historical_pe,to_date,consensus_period_end,earnings_quality_flags,fcf_anchors,earnings_dislocation,industry_summary,consensus_quarter_end
 
-SCHEMA='valuation-data-v3'
+SCHEMA='valuation-data-v4'
 KNOWN_NOTES={
  'MRVL':('MRVL FY2026 includes a large automotive Ethernet disposal gain. Do not compound reported EPS as recurring earnings without review. EBITDA also requires definition/one-off checks.',
          ['https://investor.marvell.com/sec-filings/all-sec-filings/content/0001104659-26-060265/0001104659-26-060265.pdf']),
@@ -89,6 +91,10 @@ def enrich(data,stock,info,peer_symbols=()):
     for r in data['historical']:
         h=next((x for x in data['fcf_history'] if x['period_end']==r['period_end'] and not x.get('ttm')),None)
         if h: r.update(fcf=h['fcf'],sbc=h['sbc'],fcf_conversion=h['conversion'])
+    rate=num(info.get('dividendRate')) or num(info.get('trailingAnnualDividendRate'))
+    dy=rate/price if rate and price and price>0 else None
+    current['dividend_yield']=dy if dy is not None and 0<dy<0.25 else None      # annual dividend per share ÷ price, both in the trading currency
+    current['dividend_basis']='Provider annual dividend per share ÷ price. A rough guide: the lab\'s returns are price returns and do not include it.'
     data['analyst_targets']=dict(mean=num(info.get('targetMeanPrice')),median=num(info.get('targetMedianPrice')),
         low=num(info.get('targetLowPrice')),high=num(info.get('targetHighPrice')),analysts=num(info.get('numberOfAnalystOpinions')),
         currency=currency,source=source,retrieved_at=now,published_at=None,horizon=None,
@@ -107,6 +113,12 @@ def enrich(data,stock,info,peer_symbols=()):
     if b['total_debt'] is not None and b['total_cash'] is not None: b['net_debt']=b['total_debt']-b['total_cash']
     if b['enterprise_value'] and b['net_debt'] is not None and b['shares'] and price:
         r=(price*b['shares']+b['net_debt'])/b['enterprise_value'];data['ev_check']=dict(ratio=r,ok=.75<=r<=1.33)
+    own_ev=(price*b['shares']+b['net_debt'])/b['ebitda'] if (b.get('ebitda') and b['ebitda']>0 and b.get('net_debt') is not None and b.get('shares') and price) else None
+    prov_ev=current.get('enterprise_to_ebitda')
+    if own_ev and prov_ev and abs(prov_ev/own_ev-1)>.3:
+        current['enterprise_to_ebitda_provider']=prov_ev;current['enterprise_to_ebitda']=own_ev
+        current['ev_ebitda_note']=f'The provider\'s EV/EBITDA ({prov_ev:,.1f}x) does not match market value + net debt over EBITDA ({own_ev:,.1f}x, calculated here). The calculated figure is shown.'
+        data['warnings'].append(current['ev_ebitda_note'])
     data['revenue_anchors']=rlead+[dict(id='revenue:'+r['period_end'],value=r['revenue'],period_end=r['period_end'],
         currency=r.get('currency'),category='historical_reported',source=r['source'],retrieved_at=now,
         published_at=None,unit='full_currency_units') for r in data['historical'] if num(r.get('revenue')) is not None and r['revenue']>0]
@@ -154,14 +166,10 @@ def enrich(data,stock,info,peer_symbols=()):
         data['ttm_ebitda_margin']=b['ebitda']/rev_ttm
     data['earnings_dislocation']=earnings_dislocation(data)
     if data['earnings_dislocation']: data['method_notes']+=data['earnings_dislocation']['lines'][-1:]
-    data['defaults']=status_quo(data)
-    data['growth_refs']=growth_refs(data)
+    data['period_table']=build_period_table(data)
     data['method_fit']=method_fit(data)
-    pick,mm=pfcf_defaults(data,(data['method_fit'].get('p_fcf') or {}).get('use_after_sbc'))
-    pf=data['defaults']['p_fcf'];pf['anchor_id']=pick['id'] if pick else None;pf['multiple_by_anchor']=mm
-    pf_now=mm.get(pick['id']) if pick else None
-    pf['exit_multiple']=round(pf_now,1) if meaningful('p_fcf',pf_now) else None
-    pf['multiple_note']=None if pf_now is None or meaningful('p_fcf',pf_now) else withheld_note('p_fcf',pf_now)
+    data['defaults']=build_defaults(data,data['method_fit'])
+    data['growth_refs']=growth_refs(data)
     if fx.get('applied'):
         data['warnings'].append(fx['text'])
         pe_t=num(info.get('trailingPE'));tt=next((x for x in data['anchors'] if x['id']=='ttm'),None)

@@ -2,7 +2,7 @@
 An import that no saved result uses is replaced when the same ticker is imported again."""
 from pathlib import Path
 from datetime import datetime, timezone
-import json, sqlite3, uuid, re
+import json, sqlite3, uuid, re, shutil
 from contextlib import contextmanager
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -11,17 +11,44 @@ from ..core.valuation import Assumptions, EbitdaAssumptions, PfcfAssumptions, ca
 from ..adapters.valuation_adapter import fetch
 from ..adapters.valuation_references import SCHEMA
 from ..core.compare import compare as compare_rows
+from ..core.diagnosis import diagnose
 from ..core.snapshots import history_rows, delete_record, prune_data
+from ..core.valuation import FORMULA
+from ..core.period_table import table_of
+from ..core.valuation_link import estimate_changes, estimate_text
 
 ROOT=Path(__file__).resolve().parents[2]
 DB=ROOT/"valuation.db"
 router=APIRouter()
-VALUATION_API=7   # bump when request/response shapes change; the page checks it against /api/v1/health
+VALUATION_API=8   # bump when request/response shapes change; the page checks it against /api/v1/health
+
+SCHEMA_VERSION=4   # PRAGMA user_version of valuation.db: 4 = valuation-v4 records only
+
+def _is_v4(kind,payload):
+    if kind=="data": return payload.get("schema_version")==SCHEMA
+    if kind=="analysis": return (payload.get("result") or {}).get("formula_version")==FORMULA
+    if kind=="comparison": return all(m.get("exit_fy") for r in (payload.get("result") or {}).get("rows",[]) for m in r.get("methods",[]))
+    return False
+
+def migrate(c):
+    """Upgrade from the 2.28 valuation model: back the file up once as valuation.v3.bak.db, then drop records the new model cannot read.
+    The workbench database (reviews, notes, assumption links) is a different file and is never touched."""
+    if c.execute("PRAGMA user_version").fetchone()[0]>=SCHEMA_VERSION: return
+    rows=c.execute("SELECT id,kind,payload FROM valuations").fetchall()
+    if rows:
+        c.commit()
+        bak=DB.with_name("valuation.v3.bak.db")
+        if not bak.exists(): shutil.copyfile(DB,bak)
+        old=[r[0] for r in rows if not _is_v4(r[1],json.loads(r[2]))]
+        c.executemany("DELETE FROM valuations WHERE id=?",[(i,) for i in old])
+    c.execute("PRAGMA user_version=%d"%SCHEMA_VERSION)
+    c.commit()
 
 @contextmanager
 def connect():
     c=sqlite3.connect(DB)
     c.execute("CREATE TABLE IF NOT EXISTS valuations (id TEXT PRIMARY KEY, ticker TEXT NOT NULL, kind TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL)")
+    migrate(c)
     try:
         with c:
             yield c
@@ -51,6 +78,14 @@ def hydrated(rec):
 @router.get("/valuation")
 def page(): return FileResponse(ROOT/"app/static/valuation.html",headers={"Cache-Control":"no-store"})
 
+def estimate_notice(ticker):
+    """Returns a function: given a new data payload, one factual line on how the analysts' numbers moved since the newest saved analysis, or None.
+    Nothing is overwritten; the saved analysis keeps the estimates it used."""
+    with connect() as c:
+        row=c.execute("SELECT payload FROM valuations WHERE ticker=? AND kind='analysis' ORDER BY rowid DESC LIMIT 1",(ticker,)).fetchone()
+    used=(json.loads(row[0]).get("result") or {}).get("estimates_used") if row else None
+    return lambda payload: (estimate_text(estimate_changes(used,table_of(payload))) if used else None)
+
 class FetchRequest(BaseModel):
     peers: list[str] = Field(default_factory=list,max_length=5)
     industry: bool = False
@@ -61,9 +96,11 @@ def load(ticker: str, req: FetchRequest | None = None):
     if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}",ticker): raise HTTPException(422,"Invalid ticker")
     peers=[s.strip().upper() for s in (req.peers if req else [])]
     if any(not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}",s) for s in peers): raise HTTPException(422,"Invalid peer ticker")
+    notice=estimate_notice(ticker)
     rec=save(ticker,"data",fetch(ticker,peer_symbols=list(dict.fromkeys(peers)),industry=bool(req and req.industry)))
+    notice=notice(rec["payload"])
     with connect() as c: prune_data(c,ticker)      # earlier imports that no saved result uses are replaced by this one
-    return rec
+    return dict(rec,estimate_notice=notice)
 
 @router.get("/api/v1/valuation/{ticker}/history")
 def history(ticker: str):
@@ -101,6 +138,8 @@ def compute(req: Request):
     if data["kind"]!="data": raise HTTPException(422,"Select a data snapshot")
     try: result=calculate(data["payload"],req.assumptions)
     except (ValueError,OverflowError) as e: raise HTTPException(422,str(e))
+    try: result["diagnosis"]=diagnose(data["payload"],req.assumptions,result)
+    except (ValueError,OverflowError,KeyError,TypeError,ZeroDivisionError) as e: result["diagnosis"]=None   # the read-this-first block is advice; it never blocks the calculation
     comparison=consensus_bridge(data["payload"],req.reference.pe,req.reference.spread) if req.reference else None
     payload=dict(data_id=req.data_id,result=result,market_comparison=comparison)
     if not req.persist: return hydrated(dict(id=None,ticker=data["ticker"],kind="analysis",created_at=None,payload=payload))
@@ -138,7 +177,7 @@ def latest_data(ticker,hours):
 class CompareRequest(BaseModel):
     model_config=ConfigDict(allow_inf_nan=False,extra="forbid")
     tickers: list[str] = Field(min_length=2,max_length=5)
-    years: int = Field(default=3,ge=1,le=10)
+    years: float = Field(default=3,ge=0.5,le=10)
     required_return: float | None = Field(default=None,gt=-1,le=1)
     multiple_shift: float = Field(default=0,gt=-.9,le=2)
     reuse_hours: float = Field(default=6,ge=0,le=72)

@@ -1,187 +1,242 @@
+"""The valuation engine (formula valuation-v4), checked against hand calculations on an offline company."""
 import copy
-import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from app.core.valuation import Assumptions,calculate
-from app.api import valuation as api
+import math
+import unittest
 
-@pytest.fixture
-def data():
-    return dict(ticker='TEST',retrieved_at='2026-01-01T00:00:00+00:00',quote=dict(value=50,currency='USD'),anchors=[dict(id='annual:2026-01-01',value=2,currency='USD',period_end='2026-01-01',category='historical_reported')])
-def assumptions(**changes):
-    return Assumptions(**(dict(anchor_id='annual:2026-01-01',years=3,required_return=.1,growth=.1,exit_pe=20,growth_spread=.05,pe_spread=.2,acknowledge_basis=True)|changes))
-def test_formula_and_reverse(data):
-    r=calculate(data,assumptions());years=r['growth_years'];expected=2*1.1**years*20
-    assert r['scenarios'][1]['future_price']==pytest.approx(expected)
-    assert r['scenarios'][1]['discounted_terminal']==pytest.approx(expected/1.1**3)
-    assert 2*(1+r['reverse']['required_eps_growth'])**years*20==pytest.approx(50*1.1**3)
-    assert r['scenarios'][0]['future_price']<expected<r['scenarios'][2]['future_price']
-@pytest.mark.parametrize('value',[None,0,-2])
-def test_missing_or_loss_eps(data,value):
-    data['anchors'][0]['value']=value
-    with pytest.raises(ValueError):calculate(data,assumptions())
-def test_currency_mismatch(data):
-    data['anchors'][0]['currency']='CAD'
-    with pytest.raises(ValueError,match='no exchange rate'):calculate(data,assumptions())
-def test_missing_quote(data):
-    data['quote']['value']=None
-    with pytest.raises(ValueError,match='price'):calculate(data,assumptions())
-def test_no_ack(data):
-    with pytest.raises(ValueError,match='Confirm'):calculate(data,assumptions(acknowledge_basis=False))
-def test_growth_boundary(data):
-    with pytest.raises(ValueError):calculate(data,assumptions(growth=-.8,growth_spread=.3))
-@pytest.mark.parametrize('changes',[{'growth':float('nan')},{'exit_pe':float('inf')},{'years':0},{'pe_spread':1}])
-def test_invalid_assumptions(changes):
-    with pytest.raises(ValueError):assumptions(**changes)
-def test_no_mutation(data):
-    old=copy.deepcopy(data);calculate(data,assumptions());assert data==old
-
-def test_api_append_only_and_offline_replay(tmp_path,monkeypatch,data):
-    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db');monkeypatch.setattr(api,'fetch',lambda _,**k:data)
-    app=FastAPI();app.include_router(api.router);client=TestClient(app)
-    snap=client.post('/api/v1/valuation/TEST/fetch').json()
-    req=dict(data_id=snap['id'],assumptions=assumptions().model_dump())
-    one=client.post('/api/v1/valuation/calculate',json=req);two=client.post('/api/v1/valuation/calculate',json=req)
-    assert one.status_code==two.status_code==200
-    assert one.json()['id']!=two.json()['id']
-    assert one.json()['payload']['result']==two.json()['payload']['result']
-    assert client.get('/api/v1/valuation/snapshots/'+snap['id']).json()['payload']==data   # data snapshot unchanged
-    assert len(client.get('/api/v1/valuation/TEST/history').json())==3
-    req['data_id']=one.json()['id']
-    assert client.post('/api/v1/valuation/calculate',json=req).status_code==422
-    assert client.get('/api/v1/valuation/snapshots/missing').status_code==404
-
-def test_provider_mapping_and_consensus_currency(monkeypatch):
-    import pandas as pd
-    import yfinance
-    from types import SimpleNamespace
-    from app.adapters.valuation_adapter import fetch,OpenBBAdapter
-    def call(operation,fn):
-        rows=[dict(last_price=50,currency='USD')] if operation=='quote' else [dict(period_ending='2026-01-31',diluted_earnings_per_share=2.5,total_revenue=1000)]
-        return SimpleNamespace(results=rows,provider='yfinance',warnings=None,extra=None)
-    monkeypatch.setattr(OpenBBAdapter,'_call',staticmethod(call))
-    class Stock:
-        def get_info(self): return dict(currency='USD',financialCurrency='USD',regularMarketPrice=50,regularMarketTime=1791576000)
-        def get_earnings_estimate(self): return pd.DataFrame([dict(avg=3,currency='USD',numberOfAnalysts=10)],index=['0y'])
-        get_revenue_estimate=get_earnings_estimate
-    monkeypatch.setattr(yfinance,'Ticker',lambda _:Stock())
-    d=fetch('TEST')
-    assert d['anchors'][0]['value']==2.5
-    assert d['historical'][0]['revenue']==1000
-    assert d['quote']['observed_at']=='2026-10-09T20:00:00+00:00'
-    assert len(d['estimates'])==2
-    assert d['estimates'][0]['published_at'] is None
-    assert d['estimates'][0]['period_end'] is None
-    assert all(x['category']=='historical_reported' for x in d['anchors'])
-
-def test_provider_failure_does_not_invent(monkeypatch):
-    import yfinance
-    from app.adapters.valuation_adapter import fetch,OpenBBAdapter
-    def fail(*a,**k): raise RuntimeError('offline test')
-    monkeypatch.setattr(OpenBBAdapter,'_call',staticmethod(fail))
-    monkeypatch.setattr(yfinance,'Ticker',fail)
-    d=fetch('TEST')
-    assert d['quote']['value'] is None and d['anchors']==[] and d['estimates']==[]
-    assert any('offline test' in w for w in d['warnings'])
-
-from datetime import date
-from app.core.valuation import EbitdaAssumptions,anniversary,consensus_bridge
+from app.core.valuation import (Assumptions, EbitdaAssumptions, PfcfAssumptions, calculate, consensus_bridge, rates, FORMULA)
 from app.core.valuation_context import historical_pe
-
-def ev_assumptions(**changes):
-    return EbitdaAssumptions(**(dict(method='ev_ebitda',anchor_id='revenue:2026-01-01',years=2,required_return=.1,
-        growth=.1,growth_spread=.05,margin=.2,margin_spread=.05,exit_multiple=15,multiple_spread=.1,
-        target_net_debt=100,target_shares=10,other_claims=20,balance_assumption='user_forecast',acknowledge_basis=True)|changes))
-
-@pytest.fixture
-def ev_data(data):
-    data['revenue_anchors']=[dict(id='revenue:2026-01-01',value=1000,currency='USD',period_end='2026-01-01')]
-    data['market_baseline']=dict(currency='USD',net_debt=100,shares=10)
-    return data
-
-def test_calendar_anniversary():
-    assert anniversary(date(2026,10,10),2)==date(2028,10,10)
-    assert anniversary(date(2024,2,29),1)==date(2025,2,28)
-
-def test_ev_equity_bridge_and_reverse(ev_data):
-    a=ev_assumptions();r=calculate(ev_data,a);b=r['scenarios'][1]
-    assert b['revenue']==pytest.approx(1000*1.1**r['growth_years'])
-    assert b['ebitda']==pytest.approx(b['revenue']*.2)
-    assert b['future_price']==pytest.approx((b['ebitda']*15-100-20)/10)
-    needed=r['reverse']['required_ebitda']
-    assert (needed*15-100-20)/10==pytest.approx(50*1.1**2)
-    assert r['reverse']['required_margin']*b['revenue']==pytest.approx(needed)
-    assert b['ebitda']*r['reverse']['required_exit_multiple']-120==pytest.approx(50*1.1**2*10)
-    assert r['required_exit_price']==pytest.approx(60.5)
-
-def test_ev_net_cash_and_limited_equity(ev_data):
-    cash=calculate(ev_data,ev_assumptions(target_net_debt=-100))
-    debt=calculate(ev_data,ev_assumptions(target_net_debt=100))
-    assert cash['scenarios'][1]['future_price']-debt['scenarios'][1]['future_price']==pytest.approx(20)
-    loss=calculate(ev_data,ev_assumptions(target_net_debt=1e9))['scenarios'][1]
-    assert loss['future_price']==0 and loss['price_cagr']==-1 and loss['equity_floor_applied']
-
-@pytest.mark.parametrize('changes',[dict(margin=.02,margin_spread=.05),dict(margin=.95,margin_spread=.1),dict(balance_assumption='hold_current_constant',target_shares=11)])
-def test_ev_invalid_basis(ev_data,changes):
-    with pytest.raises(ValueError):calculate(ev_data,ev_assumptions(**changes))
-
-def test_ev_fixed_balance_is_explicit(ev_data):
-    assert calculate(ev_data,ev_assumptions(balance_assumption='hold_current_constant'))['assumptions']['balance_assumption']=='hold_current_constant'
-    ev_data['market_baseline']['net_debt']=None
-    with pytest.raises(ValueError):calculate(ev_data,ev_assumptions(balance_assumption='hold_current_constant'))
-
-def test_historical_pe_no_future_price_or_negative_eps():
-    rows=[dict(period_end='2025-12-31',diluted_eps=2,currency='USD'),dict(period_end='2024-12-31',diluted_eps=-1,currency='USD')]
-    prices=[dict(date='2025-12-30',close=40),dict(date='2026-01-01',close=1000),dict(date='2024-12-31',close=20)]
-    r=historical_pe(rows,prices,'USD');assert r['rows'][0]['pe']==20
-    assert r['rows'][0]['price_date']=='2025-12-30'
-    assert r['rows'][1]['pe'] is None and r['count']==1
-    assert historical_pe(rows,prices,'CAD')['count']==0
-    assert historical_pe(rows,[dict(date='2025-12-01',close=40)],'USD')['count']==0
-
-def test_consensus_bridge_not_quarter_annualization(data):
-    data['estimates']=[dict(metric='eps',period='0q',avg=1,currency='USD'),dict(metric='eps',period='+1y',avg=4,currency='USD')]
-    r=consensus_bridge(data,20,.1)
-    assert len(r['rows'])==1
-    assert [x['price'] for x in r['rows'][0]['prices']]==[72,80,88]
-    assert 'price_cagr' not in r['rows'][0]['prices'][0]
-    data['estimates'][1]['currency']='CAD'
-    assert 'error' in consensus_bridge(data,20,.1)['rows'][0]
-
-def test_api_second_method_and_references(tmp_path,monkeypatch,ev_data):
-    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db');monkeypatch.setattr(api,'fetch',lambda _,**k:ev_data)
-    app=FastAPI();app.include_router(api.router);client=TestClient(app)
-    snap=client.post('/api/v1/valuation/TEST/fetch').json()
-    req=dict(data_id=snap['id'],assumptions=ev_assumptions().model_dump())
-    r=client.post('/api/v1/valuation/calculate',json=req)
-    assert r.status_code==200 and r.json()['payload']['result']['method']=='ev_ebitda'
-    assert client.post('/api/v1/valuation/reference-prices',json=dict(data_id=snap['id'],pe=25,spread=.05)).status_code==200
-    assert client.post('/api/v1/valuation/TEST/fetch',json=dict(peers=['A']*6)).status_code==422
-
-def test_reference_enrichment_with_stubbed_history(monkeypatch):
-    import pandas as pd
-    from app.adapters.valuation_references import enrich
-    class Stock:
-        def history(self,**kwargs):
-            assert kwargs['auto_adjust'] is False
-            return pd.DataFrame({'Close':[50]},index=pd.to_datetime(['2025-12-31']))
-    d=dict(ticker='TEST',retrieved_at='2026-10-10T00:00:00+00:00',quote=dict(value=60,currency='USD'),estimates=[],historical=[dict(period_end='2025-12-31',currency='USD',diluted_eps=2,revenue=1000,source='fixture')],anchors=[],revenue_anchors=[],warnings=[],raw={},methods={})
-    info=dict(financialCurrency='USD',totalCash=10,totalDebt=50,sharesOutstanding=100,targetMeanPrice=70,trailingPE=30,forwardPE=20)
-    r=enrich(d,Stock(),info)
-    assert r['historical_pe']['rows'][0]['pe']==25
-    assert r['market_baseline']['net_debt']==40
-    assert r['analyst_targets']['mean']==70 and r['analyst_targets']['horizon'] is None
-    assert r['current_multiples']['forward_pe']==20
-
-def test_saved_market_comparison_replays(tmp_path,monkeypatch,data):
-    monkeypatch.setattr(api,'DB',tmp_path/'valuation.db')
-    data['estimates']=[dict(metric='eps',period='+1y',avg=4,currency='USD')]
-    monkeypatch.setattr(api,'fetch',lambda _,**k:data)
-    app=FastAPI();app.include_router(api.router);client=TestClient(app)
-    s=client.post('/api/v1/valuation/TEST/fetch').json()
-    r=client.post('/api/v1/valuation/calculate',json=dict(data_id=s['id'],assumptions=assumptions().model_dump(),reference=dict(pe=25,spread=.1)))
-    assert r.status_code==200
-    saved=r.json();assert saved['payload']['market_comparison']['rows'][0]['prices'][1]['price']==100
-    assert client.get('/api/v1/valuation/snapshots/'+saved['id']).json()==saved
+from tests.fixtures_val import company, days_to
 
 
+def pe(**kw):
+    base = dict(exit_fy='2029-12-31', required_return=.1, growth=.10, fade_to=.06, exit_pe=20, growth_spread=.05, pe_spread=.2)
+    return Assumptions(**{**base, **kw})
+
+
+def pfcf(**kw):
+    base = dict(method='p_fcf', basis='fcf', exit_fy='2029-12-31', required_return=.1, growth=.10, growth_spread=.03, share_change=-.02, exit_multiple=17, multiple_spread=.1)
+    return PfcfAssumptions(**{**base, **kw})
+
+
+def ev(**kw):
+    base = dict(method='ev_ebitda', exit_fy='2028-12-31', required_return=.1, growth=.08, growth_spread=.02, margin=.25, margin_spread=.02, exit_multiple=8,
+                multiple_spread=.1, target_net_debt=60e6, target_shares=50e6, other_claims=20e6, balance_assumption='user_forecast')
+    return EbitdaAssumptions(**{**base, **kw})
+
+
+class GrowthPath(unittest.TestCase):
+    def test_straight_line_from_first_year_to_fade(self):
+        self.assertEqual(rates(.10, .06, 3), [.10, .08, .06]) if False else None
+        r = rates(.10, .06, 3)
+        self.assertAlmostEqual(r[0], .10); self.assertAlmostEqual(r[1], .08); self.assertAlmostEqual(r[2], .06)
+        self.assertEqual(rates(.10, None, 3), [.10] * 3); self.assertEqual(rates(.10, .06, 1), [.10]); self.assertEqual(rates(.1, .05, 0), [])
+
+
+class PeMath(unittest.TestCase):
+    def setUp(self):
+        self.d = company()
+
+    def test_base_price_is_analyst_years_then_users_years_times_multiple(self):
+        r = calculate(self.d, pe())
+        eps = 2.5 * 1.10 * 1.06                                 # FY2027 analyst EPS, then FY2028 at 10%, FY2029 at the faded 6%
+        base = r['scenarios'][1]
+        self.assertAlmostEqual(base['eps'], eps); self.assertAlmostEqual(base['future_price'], eps * 20)
+        y = days_to(self.d, '2029-12-31')
+        self.assertAlmostEqual(r['years'], y, places=2); self.assertEqual(r['formula_version'], FORMULA); self.assertEqual(r['user_years'], 2)
+        self.assertAlmostEqual(base['price_cagr'], (eps * 20 / 44) ** (1 / r['years']) - 1)
+        self.assertAlmostEqual(base['discounted_terminal'], eps * 20 / 1.1 ** r['years'])
+        self.assertEqual([a['fy'] for a in r['analyst_years']], ['FY2026', 'FY2027'])
+
+    def test_bear_and_bull_move_only_the_users_years_and_the_multiple(self):
+        r = calculate(self.d, pe())
+        bear, base, bull = r['scenarios']
+        self.assertAlmostEqual(bear['eps'], 2.5 * 1.05 * 1.01); self.assertAlmostEqual(bull['eps'], 2.5 * 1.15 * 1.11)
+        self.assertAlmostEqual(bear['exit_pe'], 16); self.assertAlmostEqual(bull['exit_pe'], 24)
+        self.assertLess(bear['future_price'], base['future_price']); self.assertLess(base['future_price'], bull['future_price'])
+        path = r['path']                                        # the analyst years in the path are the same whatever the scenario
+        self.assertEqual([p['source'] for p in path], ['analyst', 'analyst', 'yours', 'yours'])
+        self.assertAlmostEqual(path[0]['value'], 2.2); self.assertAlmostEqual(path[1]['value'], 2.5)
+
+    def test_exit_in_an_analyst_year_ignores_growth(self):
+        a = calculate(self.d, pe(exit_fy='2027-12-31', growth=.30, fade_to=.01))
+        b = calculate(self.d, pe(exit_fy='2027-12-31', growth=-.20, fade_to=None))
+        self.assertEqual(a['user_years'], 0)
+        for x, y in zip(a['scenarios'], b['scenarios']): self.assertAlmostEqual(x['eps'], 2.5); self.assertAlmostEqual(x['future_price'], y['future_price'])
+        self.assertNotEqual(a['scenarios'][0]['future_price'], a['scenarios'][2]['future_price'])       # the multiple still moves
+        self.assertTrue(any('not used' in c['text'] for c in a['checks']))
+
+    def test_holding_todays_multiple_on_this_years_figure_leaves_only_growth(self):
+        """Exit multiple = price ÷ this year's EPS, read on the exit year's EPS: the return is the EPS growth from this year, nothing else."""
+        r = calculate(self.d, pe(exit_pe=44 / 2.2, growth_spread=0, pe_spread=0))
+        base = r['scenarios'][1]
+        self.assertAlmostEqual(base['price_cagr'], (base['eps'] / 2.2) ** (1 / r['years']) - 1)
+
+    def test_return_split_is_exact_against_trailing(self):
+        r = calculate(self.d, pe())
+        self.assertAlmostEqual(r['start_multiple'], 44 / 2.1); self.assertEqual(r['reference']['label'], 'TTM')
+        for s in r['scenarios']:
+            self.assertAlmostEqual((1 + s['earnings_effect']) * (1 + s['multiple_effect']), 1 + s['price_cagr'])
+            self.assertAlmostEqual(1 + s['multiple_effect'], (s['exit_pe'] / (44 / 2.1)) ** (1 / r['years']))
+
+    def test_reverse_calculation(self):
+        r = calculate(self.d, pe()); y = r['years']; v = r['reverse']
+        self.assertAlmostEqual(v['required_eps'] * 20, 44 * 1.1 ** y)
+        self.assertAlmostEqual(2.5 * (1 + v['required_eps_growth']) ** 2, v['required_eps'])
+        self.assertAlmostEqual(v['required_exit_pe'] * r['scenarios'][1]['eps'], 44 * 1.1 ** y)
+        self.assertAlmostEqual(r['required_exit_price'], 44 * 1.1 ** y)
+        self.assertIsNone(calculate(self.d, pe(exit_fy='2027-12-31'))['reverse']['required_eps_growth'])      # no user years to solve for
+
+    def test_path_ends_at_the_base_price_and_starts_near_today(self):
+        r = calculate(self.d, pe())
+        self.assertAlmostEqual(r['path'][-1]['price'], r['scenarios'][1]['future_price'], places=6)
+        self.assertAlmostEqual(r['path'][-1]['multiple'], 20)
+        self.assertAlmostEqual(r['path'][0]['multiple'], 44 / 2.2, places=0)        # starts from today's multiple on this year's figure
+
+    def test_fade_lowers_the_price(self):
+        flat = calculate(self.d, pe(exit_fy='2031-12-31', fade_to=None, growth=.2)); fade = calculate(self.d, pe(exit_fy='2031-12-31', fade_to=.05, growth=.2))
+        self.assertLess(fade['scenarios'][1]['future_price'], flat['scenarios'][1]['future_price'])
+
+    def test_old_record_without_a_table_gives_the_same_result(self):
+        d = copy.deepcopy(self.d); d.pop('period_table')
+        self.assertEqual(calculate(d, pe())['scenarios'], calculate(self.d, pe())['scenarios'])
+
+    def test_no_mutation(self):
+        old = copy.deepcopy(self.d); calculate(self.d, pe()); self.assertEqual(self.d, old)
+
+
+class Rejections(unittest.TestCase):
+    def setUp(self):
+        self.d = company()
+
+    def test_exit_year_must_be_one_of_the_offered_fiscal_year_ends(self):
+        for bad in ('2026-12-31', '2029-06-30', 'soon', '2040-12-31'):
+            with self.assertRaises(ValueError): calculate(self.d, pe(exit_fy=bad))
+        self.assertEqual(calculate(self.d, pe(exit_fy='FY2029'))['exit_fy'], 'FY2029')
+
+    def test_missing_price_and_currency_mismatch(self):
+        self.d['quote']['value'] = None
+        with self.assertRaises(ValueError) as cm: calculate(self.d, pe())
+        self.assertIn('price', str(cm.exception))
+        d = company(currency='CAD', fin_currency='USD')
+        with self.assertRaises(ValueError) as cm: calculate(d, pe())
+        self.assertIn('no exchange rate', str(cm.exception))
+
+    def test_loss_making_company_has_nothing_to_project(self):
+        d = company(eps=(-1.0, -.8, -.5, -.2), est=None, ttm_eps=-.1)
+        with self.assertRaises(ValueError): calculate(d, pe())
+
+    def test_bear_growth_boundary(self):
+        with self.assertRaises(ValueError): calculate(self.d, pe(growth=-.8, growth_spread=.3))
+
+    def test_invalid_inputs(self):
+        for kw in ({'growth': float('nan')}, {'exit_pe': float('inf')}, {'pe_spread': 1}, {'exit_pe': 0}, {'required_return': -1}):
+            with self.assertRaises(ValueError): pe(**kw)
+        with self.assertRaises(ValueError): Assumptions(required_return=.1, growth=.1, exit_pe=10, growth_spread=0, pe_spread=0)     # no exit year
+        with self.assertRaises(ValueError): Assumptions(exit_fy='2029-12-31', years=3, required_return=.1, growth=.1, exit_pe=10, growth_spread=0, pe_spread=0)   # the old field is gone
+
+
+class PfcfMath(unittest.TestCase):
+    def setUp(self):
+        self.d = company()
+
+    def test_per_share_path_and_buybacks(self):
+        r = calculate(self.d, pfcf()); b = r['scenarios'][1]
+        ps = self.d['period_table']['rows']['fcf_per_share']['E1']['value'] * (1.10 / .98) ** 2    # FY2027 derived, then two user years with buybacks
+        self.assertAlmostEqual(b['fcf_per_share'], ps); self.assertAlmostEqual(b['future_price'], ps * 17); self.assertAlmostEqual(b['fcf_yield'], 1 / 17)
+        self.assertAlmostEqual(r['reverse']['required_exit_multiple'] * ps, 44 * 1.1 ** r['years'])
+        self.assertTrue(any('no analyst forecast for free cash flow' in c['text'] for c in r['checks']))
+
+    def test_after_sbc_basis_starts_lower(self):
+        before = calculate(self.d, pfcf()); after = calculate(self.d, pfcf(basis='fcf_sbc', share_change=0))
+        self.assertAlmostEqual(after['scenarios'][1]['fcf_per_share'], self.d['period_table']['rows']['fcf_per_share_sbc']['E1']['value'] * 1.1 ** 2)
+        self.assertLess(after['scenarios'][1]['fcf_per_share'], before['scenarios'][1]['fcf_per_share'])
+        self.assertTrue(any('second time' in c['text'] for c in calculate(self.d, pfcf(basis='fcf_sbc', share_change=.01))['checks']))
+
+    def test_negative_cash_flow_cannot_be_projected(self):
+        d = company(ocf=(10e6,) * 4, capex=(-30e6,) * 4, ttm_cash=(10e6, -30e6, 1e6))
+        with self.assertRaises(ValueError): calculate(d, pfcf())
+
+
+class EvMath(unittest.TestCase):
+    def setUp(self):
+        self.d = company()
+
+    def test_equity_bridge_and_reverse(self):
+        r = calculate(self.d, ev()); b = r['scenarios'][1]
+        rev = 1210e6 * 1.08
+        self.assertAlmostEqual(b['revenue'], rev); self.assertAlmostEqual(b['ebitda'], rev * .25)
+        self.assertAlmostEqual(b['future_price'], (rev * .25 * 8 - 60e6 - 20e6) / 50e6)
+        y = r['years']; needed = r['reverse']['required_ebitda']
+        self.assertAlmostEqual((needed * 8 - 80e6) / 50e6, 44 * 1.1 ** y)
+        self.assertAlmostEqual(r['reverse']['required_margin'] * rev, needed)
+        self.assertAlmostEqual(b['ebitda'] * r['reverse']['required_exit_multiple'] - 80e6, 44 * 1.1 ** y * 50e6)
+        self.assertEqual(r['scenarios'][0]['margin'], .23); self.assertAlmostEqual(r['scenarios'][2]['margin'], .27)
+
+    def test_net_cash_and_floor(self):
+        cash = calculate(self.d, ev(target_net_debt=-60e6)); debt = calculate(self.d, ev())
+        self.assertAlmostEqual(cash['scenarios'][1]['future_price'] - debt['scenarios'][1]['future_price'], 120e6 / 50e6)
+        loss = calculate(self.d, ev(target_net_debt=1e12))['scenarios'][1]
+        self.assertEqual((loss['future_price'], loss['price_cagr'], loss['equity_floor_applied']), (0, -1, True))
+
+    def test_invalid_basis(self):
+        for kw in (dict(margin=.01, margin_spread=.02), dict(margin=.95, margin_spread=.1), dict(balance_assumption='hold_current_constant', target_shares=11)):
+            with self.assertRaises(ValueError): calculate(self.d, ev(**kw))
+        ok = calculate(self.d, ev(balance_assumption='hold_current_constant', target_net_debt=60e6, target_shares=50e6))
+        self.assertEqual(ok['assumptions']['balance_assumption'], 'hold_current_constant')
+
+
+class Checks(unittest.TestCase):
+    def setUp(self):
+        self.d = company()
+
+    def test_multiple_expansion_warns_against_todays_multiple_on_this_years_figure(self):
+        r = calculate(self.d, pe(exit_pe=40))
+        self.assertTrue(any(c['level'] == 'warn' and 'multiple expansion' in c['text'] for c in r['checks']))
+        self.assertTrue(any('de-rating' in c['text'] for c in calculate(self.d, pe(exit_pe=8))['checks']))
+        self.assertFalse(any('multiple expansion' in c['text'] for c in calculate(self.d, pe())['checks']))
+
+    def test_growth_above_the_analysts_warns_and_users_years_are_counted(self):
+        r = calculate(self.d, pe(growth=.4, growth_spread=0))
+        self.assertTrue(any(c['level'] == 'warn' and 'analysts' in c['text'] for c in r['checks']))
+        self.assertTrue(any('2 of the years to FY2029 rest' in c['text'] for c in r['checks']))
+
+    def test_stale_reported_year_warns(self):
+        d = company(valuation='2027-06-01', next_fy='2027-12-31', est=(2.2, 2.5, 1100e6, 1210e6))
+        self.assertTrue(any('months ago' in c['text'] for c in calculate(d, pe(exit_fy='2029-12-31'))['checks']))
+
+    def test_grid(self):
+        r = calculate(self.d, pe()); g = r['grid']
+        self.assertEqual([x['label'] for x in g['rows']][:3], ['Your Base path', 'Falls 20% short', 'Falls 40% short'])
+        vals = [c['value'] for c in g['columns']]; self.assertEqual(vals, sorted(vals))
+        for row in g['rows']:
+            cg = [c['cagr'] for c in row['cells']]; self.assertEqual(cg, sorted(cg))
+        mine = next(i for i, c in enumerate(g['columns']) if c['label'] == 'Your exit multiple')
+        self.assertAlmostEqual(g['rows'][0]['cells'][mine]['price'], r['scenarios'][1]['future_price'], places=4)
+
+    def test_no_recovery_row_when_trailing_earnings_are_far_below(self):
+        d = company(eps=(2.0, 1.5, 1.0, .6), ttm_eps=.6, est=(1.6, 2.0, 1100e6, 1210e6), price=30)
+        g = calculate(d, pe(exit_pe=15))['grid']
+        self.assertTrue(any('No recovery' in r['label'] for r in g['rows']))
+
+
+class OtherBits(unittest.TestCase):
+    def test_historical_pe_no_future_price_or_negative_eps(self):
+        rows = [dict(period_end='2025-12-31', diluted_eps=2, currency='USD'), dict(period_end='2024-12-31', diluted_eps=-1, currency='USD')]
+        prices = [dict(date='2025-12-30', close=40), dict(date='2026-01-01', close=1000), dict(date='2024-12-31', close=20)]
+        r = historical_pe(rows, prices, 'USD')
+        self.assertEqual(r['rows'][0]['pe'], 20); self.assertEqual(r['rows'][0]['price_date'], '2025-12-30')
+        self.assertTrue(r['rows'][1]['pe'] is None and r['count'] == 1)
+        self.assertEqual(historical_pe(rows, prices, 'CAD')['count'], 0)
+        self.assertEqual(historical_pe(rows, [dict(date='2025-12-01', close=40)], 'USD')['count'], 0)
+
+    def test_consensus_bridge_is_not_quarter_annualisation(self):
+        d = dict(quote=dict(value=50, currency='USD'), estimates=[dict(metric='eps', period='0q', avg=1, currency='USD'), dict(metric='eps', period='+1y', avg=4, currency='USD')])
+        r = consensus_bridge(d, 20, .1)
+        self.assertEqual(len(r['rows']), 1); self.assertEqual([x['price'] for x in r['rows'][0]['prices']], [72, 80, 88])
+        self.assertNotIn('price_cagr', r['rows'][0]['prices'][0])
+        d['estimates'][1]['currency'] = 'CAD'
+        self.assertIn('error', consensus_bridge(d, 20, .1)['rows'][0])
+
+
+if __name__ == '__main__':
+    unittest.main()
