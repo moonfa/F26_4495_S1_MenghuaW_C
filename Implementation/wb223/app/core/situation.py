@@ -17,8 +17,8 @@ from .valuation_context import num
 
 THRESH = dict(
     stable_years=3,          # reported years needed to call earnings "observed stable"
-    stable_range=0.35,       # (max − min) ÷ mean of EPS across those years
-    volatile_range=0.60,     # above this the earnings are volatile
+    stable_range=0.35,       # (max − min) ÷ mean of EPS across those years, with no loss and no big fall
+    eps_drop=0.25,           # a fall in EPS of this much in one year (or any loss year) is volatility; steady growth is not
     loss_years=2,            # loss years (with a loss in the trailing figure too) for "persistent loss"
     leverage=3.0,            # net debt ÷ EBITDA
     capex_share=0.60,        # capex ÷ operating cash flow
@@ -33,8 +33,8 @@ THRESH = dict(
 INDUSTRY_THRESH = {   # only the keys listed change
     'Utilities': dict(leverage=5.0, capex_share=0.9),
     'Telecom Services': dict(leverage=4.0, capex_share=0.8),
-    'Oil & Gas Integrated': dict(volatile_range=0.9),
-    'Oil & Gas E&P': dict(volatile_range=0.9),
+    'Oil & Gas Integrated': dict(eps_drop=0.5),
+    'Oil & Gas E&P': dict(eps_drop=0.5),
 }
 LABEL = {'pe': 'P/E', 'p_fcf': 'P/FCF', 'ev_ebitda': 'EV/EBITDA'}
 LEVEL = {'fit': 'Supported', 'caution': 'Limited', 'avoid': 'Unsupported'}
@@ -97,19 +97,23 @@ def states_of(data, t):
     cm = data.get('current_multiples') or {}
     ttm = num(cm.get('trailing_eps'))
     n = len(eps)
-    if n >= t['stable_years'] and all(e > 0 for e in eps):
+    ends = [r.get('period_end') for r in hist if num(r.get('diluted_eps')) is not None]
+    losses = sum(1 for e in eps if e <= 0)
+    persistent = losses >= t['loss_years'] and (ttm is None or ttm <= 0)
+    drops = [(ends[i], eps[i] / eps[i - 1] - 1) for i in range(1, n) if eps[i - 1] > 0 and eps[i] > 0 and eps[i] / eps[i - 1] - 1 <= -t['eps_drop']]
+    if persistent:
+        add('persistent_loss', 'Persistent loss', 'observed', f'EPS was a loss in {losses} of {n} reported years and the trailing figure is not positive.')
+    elif losses:
+        add('volatile', 'Earnings volatility', 'observed', f'EPS was a loss in {losses} of {n} reported years.')
+    elif drops:
+        d0 = min(drops, key=lambda x: x[1])
+        add('volatile', 'Earnings volatility', 'observed', f'EPS fell {abs(d0[1]) * 100:.0f}% in {fy_label(d0[0])} (flag: a fall of {t["eps_drop"] * 100:.0f}% or more in a year). Earnings that grow steadily are not flagged.')
+    elif n >= t['stable_years']:
         mean = sum(eps) / n
         rng = (max(eps) - min(eps)) / mean
         if rng <= t['stable_range']:
             add('stable', 'Observed stable earnings', 'observed',
                 f'EPS positive in all {n} reported years, from {min(eps):.2f} to {max(eps):.2f} (range {rng * 100:.0f}% of the average). This describes only these {n} years; it is not a forecast.')
-        elif rng > t['volatile_range']:
-            add('volatile', 'Earnings volatility', 'observed', f'EPS ranged from {min(eps):.2f} to {max(eps):.2f} over {n} reported years, {rng * 100:.0f}% of the average.')
-    elif n >= 2 and any(e <= 0 for e in eps):
-        add('volatile', 'Earnings volatility', 'observed', f'EPS was a loss in {sum(1 for e in eps if e <= 0)} of {n} reported years.')
-    losses = sum(1 for e in eps if e <= 0)
-    if losses >= t['loss_years'] and (ttm is None or ttm <= 0):
-        add('persistent_loss', 'Persistent loss', 'observed', f'EPS was a loss in {losses} of {n} reported years and the trailing figure is not positive.')
     dis = data.get('earnings_dislocation') or {}
     if dis.get('kind') in ('recovery', 'loss_to_profit'):
         add('recovery', 'Recovery expected', 'candidate',
@@ -344,4 +348,31 @@ def situation(data, a, res, review=None):
         imp = None
     return dict(archetype=arch, states=states, characteristics=chars, suitability=suit, warning=warning_of(a.method, suit, states, arch),
                 confidence=confidence_of(data, suit, a.method, t), implied=imp, review=dict(archetype=review.get('archetype'), states=review.get('states') or {}, note=review.get('note') or ''),
-                archetypes={k: v['label'] for k, v in ARCHETYPES.items()})
+                archetypes={k: v['label'] for k, v in ARCHETYPES.items()}, glossary=glossary(t))
+
+
+def glossary(t):
+    """What every label means and the number behind it, built from the same thresholds the rules use, so the page cannot drift from the code."""
+    pct = lambda x: f'{x * 100:.0f}%'
+    return dict(
+        archetypes=[dict(key=k, label=v['label'], text=v['note'], methods={m: f'{LEVEL_NAME[lv]}' + (f': {why}' if why else '') for m, (lv, why) in v['methods'].items()}) for k, v in ARCHETYPES.items()],
+        tags=[dict(label='Observed stable earnings', rule=f'Observed. At least {t["stable_years"]} reported years, all EPS positive, no fall of {pct(t["eps_drop"])} or more in a year, and (max − min) ÷ average no more than {pct(t["stable_range"])}. Describes the past years only.'),
+              dict(label='Earnings volatility', rule=f'Observed. A loss in some reported year (but not a persistent one), or EPS falling {pct(t["eps_drop"])} or more in one year. Steady growth is not volatility.'),
+              dict(label='Persistent loss', rule=f'Observed. EPS was a loss in at least {t["loss_years"]} reported years and the trailing figure is not positive. It replaces "volatility" (volatility is not shown when this applies).'),
+              dict(label='Recovery expected', rule='Candidate, needs your confirmation. Trailing EPS is a loss, or analysts expect at least 50% above it (or the trailing P/E is at least 1.6× the forward one). A forecast, not a fact.'),
+              dict(label='Accounting distortion', rule='Candidate, needs your confirmation. The latest net margin is above twice or below 40% of the prior years\' median, or free cash flow was under 0.3× or over 2.5× net income in every reported year. May be a one-off, an accounting basis difference, or real change.')],
+        characteristics=[dict(label='Dividend', rule=f'Shown from a yield of {pct(t["dividend_min"])}. Coverage warning if trailing EPS covers it less than {t["eps_cover_min"]}× or free cash flow less than {t["fcf_cover_min"]}×.'),
+                         dict(label='High leverage', rule=f'Net debt ÷ EBITDA above {t["leverage"]:g}× (or net debt with no positive EBITDA). Interest coverage is not evaluated: the data has no interest expense.'),
+                         dict(label='High capital spending', rule=f'Capex ÷ operating cash flow above {pct(t["capex_share"])} in the latest reported year.'),
+                         dict(label='Dilution / Buyback-heavy', rule=f'Average yearly share-count growth over the last reported years of {pct(t["dilution"])} or more / a fall of {pct(abs(t["buyback"]))} or more.')],
+        tiers=f'Required margin ÷ best reported margin: up to {t["implied_tiers"][0]:g}× within the reported range; up to {t["implied_tiers"][1]:g}× above the best; up to {t["implied_tiers"][2]:g}× well above; beyond that far above anything reported.',
+        relations=['Business type says what kind of company this is and sets which methods fit it by default. You can change it.',
+                   'Earnings tags describe the reported earnings: Observed ones come from the reported years; Candidates are questions for you to confirm or dismiss.',
+                   'Persistent loss replaces Volatility. Recovery expected and Accounting distortion can both be true: then part of the gap between reported and analyst earnings may be an accounting basis, not a business recovery.',
+                   'Characteristics (dividend, leverage, capex, dilution) describe the balance sheet and cash flow. They can lower a method\'s suitability (for example high leverage weakens EV/EBITDA).',
+                   'Method warning combines type, tags and characteristics; the worst reading wins. Dismissed tags are left out.',
+                   'The four evidence lines are about how reliable the inputs are; they do not change the calculation and are not added together.',
+                   'What the margin must be is a reverse check on the result: what the price needs, set against what the company has reported.'])
+
+
+LEVEL_NAME = {'Supported': 'Supported', 'Limited': 'Limited', 'Unsupported': 'Unsupported'}

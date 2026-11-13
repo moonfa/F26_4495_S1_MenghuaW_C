@@ -566,3 +566,8 @@ Table `assumption_drivers` is created on start-up. Deleting a company removes it
 - **Evidence.** Four separate statements (data quality, earnings quality, forecast evidence quality, method suitability): Adequate / Limited / Insufficient Evidence. They are not combined.
 - **Implied margin.** The margin the required exit figure asks for (net margin for P/E, FCF margin for P/FCF, EBITDA margin for EV/EBITDA) against the best and latest reported margin: ≤1.0× within the reported range, 1.0–1.2× above, 1.2–1.5× well above, >1.5× far above. For P/E and P/FCF the exit revenue is the last known revenue grown at the analysts' last revenue growth (0–15%), approximate and said so.
 - **User review.** `situation_review` (tag confirmations/dismissals, business-type override, note ≤1000 characters) is sent with calculate and saved in the analysis. No AI is used. API level 9.
+
+### 6R.1 2.30.1: Situation readability and a volatility fix
+- **Volatility.** Steadily growing earnings are no longer "volatile" (MSFT was flagged because EPS rose 9.68 → 17.95). Volatility now means a loss year or a one-year EPS fall of 25% or more (50% for oil and gas); persistent loss replaces it.
+- **Panel.** Candidate tags needing a decision are highlighted; Confirm / Dismiss show the chosen state in colour; a changed business type is marked; evidence levels are coloured; every label has a ? with its rule; a fold-out lists the business types, tag rules, thresholds and how the parts relate. The text comes from the same thresholds the rules use (`glossary()`).
+- **Guide.** The Guide tab stays in English whatever the page language and has a Situation section.

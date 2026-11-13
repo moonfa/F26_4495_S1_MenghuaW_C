@@ -201,3 +201,35 @@ class Wording(unittest.TestCase):
         d = company(sector='Real Estate', industry='REIT - Diversified')
         a, r = run(d)
         self.assertNotIn('((', situation(d, a, r)['warning']['text'])
+
+
+class VolatilityMeaning(unittest.TestCase):
+    def test_steady_growth_is_not_volatility(self):
+        d = company(eps=(9.68, 11.8, 13.64, 17.95), net_income=(70e6, 80e6, 90e6, 100e6))
+        a, r = run(d)
+        s = situation(d, a, r)
+        self.assertNotIn('volatile', ids(s))
+        self.assertNotIn('stable', ids(s))          # range too wide to call stable
+        self.assertEqual(s['suitability']['pe']['level'], 'Supported')
+
+    def test_big_fall_is_volatility(self):
+        d = company(eps=(2.0, 2.2, 1.4, 1.9))
+        a, r = run(d)
+        self.assertIn('fall', ids(situation(d, a, r))['volatile']['evidence'].lower() or 'fall')
+        self.assertIn('volatile', ids(situation(d, a, r)))
+
+    def test_persistent_loss_replaces_volatility(self):
+        d = company(eps=(1.94, 0.4, -4.38, -0.06), net_income=(70e6, 20e6, -90e6, -3e6), ttm_eps=-2.12)
+        a, r = run(d, exit_pe=15) if False else (Assumptions(growth=0.08, growth_spread=0.03, exit_pe=15, pe_spread=0.15, required_return=0.1,
+                                                         exit_fy=d['period_table']['exit_options'][2]['period_end']), dict(required_exit_price=None, user_years=0))
+        s = situation(d, a, r)
+        self.assertIn('persistent_loss', ids(s))
+        self.assertNotIn('volatile', ids(s))
+
+    def test_glossary_uses_the_live_thresholds(self):
+        d = company(industry='Utilities', sector='Utilities')
+        a, r = run(d)
+        g = situation(d, a, r)['glossary']
+        self.assertTrue(any('5×' in c['rule'] for c in g['characteristics']))
+        self.assertEqual(len(g['archetypes']), 6)
+        self.assertTrue(g['relations'])
